@@ -2296,7 +2296,7 @@ class MainWindow(QMainWindow):
         role_label = QLabel(f"Current role: <b>{self.user['role']}</b>")
         role_label.setStyleSheet("color:#ddd;")
         intro = QLabel(
-            "Use the demand planning workspace below to capture projected sales and highlight high-impact days "
+            "Use the demand planning workspace below to input projected sales and notes."
             "before the scheduling pass."
         )
         intro.setWordWrap(True)
