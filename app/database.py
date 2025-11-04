@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import datetime
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
+import json
 
 from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, UniqueConstraint, create_engine, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, sessionmaker
@@ -137,6 +138,32 @@ class Modifier(Base):
     week: Mapped[WeekContext] = relationship(back_populates="modifiers")
 
 
+class Policy(Base):
+    __tablename__ = "policies"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    # JSON payload encoded as string; parse at runtime
+    paramsJSON: Mapped[str] = mapped_column(String(8000), nullable=False, default="{}")
+    lastEditedBy: Mapped[str] = mapped_column(String(60), nullable=False, default="system")
+    lastEditedAt: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.datetime.now(datetime.timezone.utc)
+    )
+
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_policies_name"),
+    )
+
+    def params_dict(self) -> Dict:
+        try:
+            value = json.loads(self.paramsJSON or "{}")
+            if isinstance(value, dict):
+                return value
+        except json.JSONDecodeError:
+            pass
+        return {}
+
+
 engine = create_engine(
     DATABASE_URL,
     echo=False,
@@ -169,6 +196,20 @@ def init_database() -> None:
                     text(
                         "ALTER TABLE week_daily_projections "
                         "RENAME COLUMN projected_labor_hours TO projected_sales_amount"
+                    )
+                )
+        # Ensure policies table exists and has expected columns if previously created without them
+        policy_exists = conn.execute(
+            text("SELECT name FROM sqlite_master WHERE type='table' AND name='policies'")
+        ).scalar()
+        if policy_exists:
+            cols = {row[1]: True for row in conn.execute(text("PRAGMA table_info(policies)"))}
+            if "lastEditedBy" not in cols:
+                conn.execute(text("ALTER TABLE policies ADD COLUMN lastEditedBy VARCHAR(60) NOT NULL DEFAULT 'system'"))
+            if "lastEditedAt" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE policies ADD COLUMN lastEditedAt DATETIME DEFAULT (datetime('now'))"
                     )
                 )
 
@@ -240,3 +281,44 @@ def get_week_modifiers(session, week_id: int) -> List[Modifier]:
         .order_by(Modifier.day_of_week, Modifier.start_time, Modifier.id)
     )
     return list(session.scalars(stmt))
+
+
+# Policy helpers
+def get_policies(session) -> List[Policy]:
+    stmt = select(Policy).order_by(Policy.name.asc(), Policy.id.asc())
+    return list(session.scalars(stmt))
+
+
+def upsert_policy(session, name: str, params_dict: Dict, *, edited_by: str = "system") -> Policy:
+    existing: Optional[Policy] = session.execute(
+        select(Policy).where(Policy.name == name)
+    ).scalars().first()
+    payload = params_dict if isinstance(params_dict, dict) else {}
+    if existing:
+        existing.paramsJSON = json.dumps(payload)
+        existing.lastEditedBy = edited_by
+        existing.lastEditedAt = datetime.datetime.now(datetime.timezone.utc)
+        session.commit()
+        session.refresh(existing)
+        return existing
+    policy = Policy(
+        name=name,
+        paramsJSON=json.dumps(payload),
+        lastEditedBy=edited_by,
+        lastEditedAt=datetime.datetime.now(datetime.timezone.utc),
+    )
+    session.add(policy)
+    session.commit()
+    session.refresh(policy)
+    return policy
+
+
+def delete_policy(session, policy_id: int) -> None:
+    session.query(Policy).filter(Policy.id == policy_id).delete()
+    session.commit()
+
+
+def get_active_policy(session) -> Optional[Policy]:
+    # Most recently edited policy is considered active.
+    stmt = select(Policy).order_by(Policy.lastEditedAt.desc(), Policy.id.desc())
+    return session.scalars(stmt).first()
