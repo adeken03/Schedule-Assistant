@@ -47,6 +47,7 @@ from database import (
     Employee,
     EmployeeUnavailability,
     Modifier,
+    Policy,
     SessionLocal,
     WeekDailyProjection,
     get_all_employees,
@@ -54,6 +55,10 @@ from database import (
     get_or_create_week,
     get_week_daily_projections,
     get_week_modifiers,
+    get_policies,
+    upsert_policy,
+    delete_policy,
+    get_active_policy,
     init_database,
     save_week_daily_projection_values,
 )
@@ -71,6 +76,7 @@ MAX_FAILED_ATTEMPTS = 5
 LOCKOUT_MINUTES = 15
 SESSION_WARNING_SECONDS = 9 * 60
 SESSION_TIMEOUT_SECONDS = 10 * 60
+SHOW_POLICY_TO_SM = True
 
 
 def week_start_date(iso_year: int, iso_week: int) -> datetime.date:
@@ -86,6 +92,13 @@ def week_label(iso_year: int, iso_week: int) -> str:
         start_str = start.strftime("%b %d %Y")
         end_str = end.strftime("%b %d %Y")
     return f"{iso_year} W{iso_week:02d} ({start_str} - {end_str})"
+
+
+def load_active_policy_spec(session_factory) -> Dict[str, Any]:
+    # Helper for generator/validator integration points
+    with session_factory() as session:
+        policy = get_active_policy(session)
+        return policy.params_dict() if policy else {}
 
 
 def load_active_week(session_factory) -> Dict[str, Any]:
@@ -1551,6 +1564,216 @@ class DemandPlanningWidget(QWidget):
         self._apply_modifier_column_layout()
 
 
+class PolicyEditDialog(QDialog):
+    def __init__(self, *, name: str = "", params: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        self.setWindowTitle("Edit policy" if name else "Add policy")
+        self.result_data: Optional[Dict[str, Any]] = None
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("e.g. Default Policy")
+        if name:
+            self.name_input.setText(name)
+        form.addRow("Name", self.name_input)
+
+        self.json_edit = QPlainTextEdit()
+        self.json_edit.setPlaceholderText("{\"rule_key\": value, ...}")
+        pretty = json.dumps(params or {}, indent=2)
+        self.json_edit.setPlainText(pretty)
+        form.addRow("Parameters (JSON)", self.json_edit)
+        layout.addLayout(form)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setStyleSheet("color:#ff6b6b;")
+        layout.addWidget(self.feedback_label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def accept(self) -> None:
+        name = self.name_input.text().strip()
+        if not name:
+            self.feedback_label.setText("Provide a name for this policy.")
+            return
+        raw = self.json_edit.toPlainText().strip() or "{}"
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            self.feedback_label.setText(f"Invalid JSON: {e}")
+            return
+        if not isinstance(parsed, dict):
+            self.feedback_label.setText("Top-level JSON must be an object (dictionary).")
+            return
+        self.result_data = {"name": name, "params": parsed}
+        super().accept()
+
+
+class PolicyDialog(QDialog):
+    def __init__(self, session_factory, current_user: Dict[str, str], *, read_only: bool = False) -> None:
+        super().__init__()
+        self.session_factory = session_factory
+        self.current_user = current_user
+        self.read_only = read_only
+        self.setWindowTitle("Policies")
+        self.policies: List[Policy] = []
+        self._build_ui()
+        self._load_policies()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        intro = QLabel("Define schedule generation and validation rules. JSON must be a valid object.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["ID", "Name", "Parameters", "Last Edited By", "Last Edited At"])
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+
+        self.feedback_label = QLabel()
+        self.feedback_label.setStyleSheet("color:#9f9f9f;")
+        layout.addWidget(self.feedback_label)
+
+        buttons = QHBoxLayout()
+        self.add_button = QPushButton("Add")
+        self.edit_button = QPushButton("Edit")
+        self.delete_button = QPushButton("Delete")
+        self.close_button = QPushButton("Close")
+        self.add_button.clicked.connect(self.handle_add)
+        self.edit_button.clicked.connect(self.handle_edit)
+        self.delete_button.clicked.connect(self.handle_delete)
+        self.close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.add_button)
+        buttons.addWidget(self.edit_button)
+        buttons.addWidget(self.delete_button)
+        buttons.addStretch()
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+        if self.read_only:
+            self.add_button.setEnabled(False)
+            self.edit_button.setEnabled(False)
+            self.delete_button.setEnabled(False)
+
+        self.table.itemSelectionChanged.connect(self._update_buttons)
+        self._update_buttons()
+
+    def _update_buttons(self) -> None:
+        has_selection = self.table.currentRow() != -1
+        can_modify = (not self.read_only) and has_selection
+        self.edit_button.setEnabled(can_modify)
+        self.delete_button.setEnabled(can_modify)
+
+    def _load_policies(self) -> None:
+        with self.session_factory() as session:
+            self.policies = get_policies(session)
+        self._refresh_table()
+
+    def _refresh_table(self) -> None:
+        self.table.setRowCount(len(self.policies))
+        for row, policy in enumerate(self.policies):
+            params = policy.params_dict()
+            summary = ", ".join([f"{k}={v}" for k, v in list(params.items())[:4]])
+            if len(params) > 4:
+                summary += ", …"
+            cells = [
+                QTableWidgetItem(str(policy.id)),
+                QTableWidgetItem(policy.name),
+                QTableWidgetItem(summary),
+                QTableWidgetItem(policy.lastEditedBy or ""),
+                QTableWidgetItem(policy.lastEditedAt.strftime("%Y-%m-%d %H:%M")),
+            ]
+            for col, item in enumerate(cells):
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, col, item)
+
+    def _selected_policy(self) -> Optional[Policy]:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self.policies):
+            return None
+        return self.policies[row]
+
+    def handle_add(self) -> None:
+        if self.read_only:
+            return
+        dialog = PolicyEditDialog()
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
+            return
+        data = dialog.result_data
+        with self.session_factory() as session:
+            policy = upsert_policy(session, data["name"], data["params"], edited_by=self.current_user.get("username", "system"))
+        audit_logger.log(
+            "policy_create",
+            self.current_user.get("username", "unknown"),
+            role=self.current_user.get("role"),
+            details={"policy_id": policy.id, "name": policy.name},
+        )
+        self.feedback_label.setStyleSheet("color:#3cb371;")
+        self.feedback_label.setText(f"Added/updated policy '{policy.name}'.")
+        self._load_policies()
+
+    def handle_edit(self) -> None:
+        if self.read_only:
+            return
+        policy = self._selected_policy()
+        if not policy:
+            return
+        dialog = PolicyEditDialog(name=policy.name, params=policy.params_dict())
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
+            return
+        data = dialog.result_data
+        with self.session_factory() as session:
+            updated = upsert_policy(session, data["name"], data["params"], edited_by=self.current_user.get("username", "system"))
+        audit_logger.log(
+            "policy_update",
+            self.current_user.get("username", "unknown"),
+            role=self.current_user.get("role"),
+            details={"policy_id": updated.id, "name": updated.name},
+        )
+        self.feedback_label.setStyleSheet("color:#3cb371;")
+        self.feedback_label.setText(f"Updated policy '{updated.name}'.")
+        self._load_policies()
+
+    def handle_delete(self) -> None:
+        if self.read_only:
+            return
+        policy = self._selected_policy()
+        if not policy:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Delete policy",
+            f"Remove policy '{policy.name}'?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        with self.session_factory() as session:
+            delete_policy(session, policy.id)
+        audit_logger.log(
+            "policy_delete",
+            self.current_user.get("username", "unknown"),
+            role=self.current_user.get("role"),
+            details={"policy_id": policy.id, "name": policy.name},
+        )
+        self.feedback_label.setStyleSheet("color:#ffd166;")
+        self.feedback_label.setText(f"Deleted policy '{policy.name}'.")
+        self._load_policies()
+
+
 class EmployeeEditDialog(QDialog):
     def __init__(
         self,
@@ -2319,6 +2542,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.store = store
         self.user = user
+        self.user_role = self.user.get("role")
         self.session_factory = session_factory
         self.active_week = load_active_week(self.session_factory)
         self.setWindowTitle("Schedule Assistant")
@@ -2393,6 +2617,18 @@ class MainWindow(QMainWindow):
             manage_accounts_button = QPushButton("Manage accounts")
             manage_accounts_button.clicked.connect(self.open_account_manager)
             footer_row.addWidget(manage_accounts_button)
+
+        # Manage Policies action with role-based visibility
+        self.policy_action = QPushButton("Manage policies")
+        self.policy_action.clicked.connect(self.open_policy_manager)
+        # Visibility and enablement rules
+        if self.user_role in {"IT", "GM"}:
+            footer_row.addWidget(self.policy_action)
+        elif SHOW_POLICY_TO_SM and self.user_role == "SM":
+            footer_row.addWidget(self.policy_action)
+        # Enforce disabled state for non-editor roles unless read-only is allowed
+        if self.user_role not in ("GM", "IT") and not (SHOW_POLICY_TO_SM and self.user_role == "SM"):
+            self.policy_action.setEnabled(False)
 
         change_password_button = QPushButton("Change password")
         change_password_button.clicked.connect(self.open_change_password)
@@ -2495,6 +2731,23 @@ class MainWindow(QMainWindow):
         dialog.setStyleSheet(THEME_STYLESHEET)
         if dialog.exec() == QDialog.Accepted and dialog.password_changed:
             QMessageBox.information(self, "Password updated", "Your password has been changed successfully.")
+
+    def open_policy_manager(self) -> None:
+        # Determine access level
+        if self.user_role in {"GM", "IT"}:
+            read_only = False
+        elif SHOW_POLICY_TO_SM and self.user_role == "SM":
+            read_only = True
+        else:
+            QMessageBox.information(
+                self,
+                "Access restricted",
+                "Access restricted to General Managers and IT Assistants.",
+            )
+            return
+        dialog = PolicyDialog(self.session_factory, self.user, read_only=read_only)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        dialog.exec()
 
     def handle_logout(self) -> None:
         confirm = QMessageBox.question(self, "Sign out", "Return to sign-in screen?")
