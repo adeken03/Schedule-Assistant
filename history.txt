@@ -2,48 +2,40 @@ Schedule Assistant history
 ==========================
 
 Version beta-00001
-- Created the repository and scaffolded the initial project layout.
+- Started the repo and dropped in the base layout.
 
 Version beta-00002
-- Brought up the PySide6 desktop shell with role-aware login gating and a minimal dashboard.
-- Added a JSON-backed account store seeded with the IT assistant credentials so the app is usable on first launch.
+- Got the PySide6 shell running with role-aware login and a tiny dashboard plus the JSON account seed.
 
 Version beta-00003
-- Hardened authentication by moving to salted PBKDF2 hashes and wiring in self-service password changes.
-- Enforced role-aware rules for creating/deleting accounts and added the Python launcher that bootstraps `.venv` with one command.
+- Moved auth to salted PBKDF2, added self-serve password changes, and shipped the one-command launcher.
 
 Version beta-00004
-- Implemented centralized audit logging that captures every login attempt and account lifecycle event.
-- Added a configurable lockout policy with on-screen status inside the Account Manager so GMs can clear or review incidents quickly.
+- Added audit logging plus a lockout flow so managers can track and clear bad attempts.
 
 Version beta-00005
-- Introduced Buffalo Wild Wings role presets, employee start-date tracking, and the first pass of the SQLite/SQLAlchemy data layer.
-- Expanded the Employee Directory with active/inactive filters, availability editing, and audit notes for each change.
-- Added the persistent ISO week selector with saved contexts plus a 9-minute inactivity warning and 10-minute auto sign-out.
+- Seeded BWW role presets, employee start dates, the SQLite layer, richer directory tools, and the ISO week picker with session timers.
 
 Version beta-00006
-- Wrapped the main window in QScrollArea and refreshed layouts so the UI survives varying DPI and laptop screens.
+- Wrapped the main window in a scroll area so layouts hold up on every screen.
 
 Version beta-00007
-- Fixed the sales heat-map math so modifiers apply only to their time windows and correctly split across midnight.
-- Simplified tooltips to a single duration-weighted delta so shift editors see clear net effects.
+- Fixed modifier math around midnight and cut tooltips down to one clear delta.
 
 Version beta-00008
-- Renamed Demand Planning to Week Preparation and introduced the dedicated Validate / Import / Export tab.
-- Added JSON import/export for employees, projections, modifiers, and week schedules, including week-to-week copy helpers and audit logging for every transfer.
-- Refreshed the theme (charcoal palette, calmer login dialog) and rebuilt the seeded roster with realistic availability notes.
+- Renamed Week Prep, stood up the Validate / Import / Export tab, brought JSON import/export online, and refreshed the theme plus roster.
 
 Version beta-00009
-- Matched the Employee Directory dialog width to the main window for easier roster scanning.
-- Polished the Validate / Import / Export hub and added Week Schedule multi-select controls for swap or grant actions.
-- Shipped the Policy Composer so GMs edit guardrails, time blocks, and per-role coverage without touching raw JSON, and the generator now honors those structured rules.
+- Matched the Employee Directory width to the shell, smoothed the Validate hub, tightened swap/grant UX, and shipped Policy Composer tied to the generator.
 
 Version beta-00010
-- Extended the Policy Composer with operating-hours inputs, open/close buffers, and anchor-aware block definitions (`@open`, `@close`).
-- Updated the generator to respect the anchors/buffers, improve role matching, and surface clearer coverage warnings.
-- Synced README, TODO, and automated tests with the new scheduling workflow so IT/HR can follow the process end to end.
+- Let Policy Composer set hours, buffers, and `@open/@close` anchors, taught the generator to honor them, and synced the docs/tests.
 
 Version beta-00011
-- Week Preparation and Week Schedule now power the full weekly workflow with live projections, modifiers, and coverage editing.
-- Validate / Import / Export manages employees, projections, modifiers, and shift grids with audit-ready history.
-- Week Schedule grid gained inline hints plus faster swap/grant UX, Employee Directory borrowed the new palette, and the seed data grew to 39 active employees so generator smoke tests feel like a real store.
+- Week Prep and Week Schedule now cover the full run with live data, Validate handles transfers, and the grid plus seed roster feel like the real store.
+
+Version beta-00012
+- Simplified the week picker, added a saved modifier shelf, merged policy access, added bulk delete, and tightened generator rules.
+
+Version beta-00013
+- Final cleanup before the repo push; everything is stable except the policy and schedule generator modules we will fix later.

@@ -268,7 +268,7 @@ DEFAULT_TIMEBLOCKS: Dict[str, Dict[str, str]] = {
     "Open": {"start": "@open-30", "end": "@open"},
     "Mid": {"start": "@open", "end": "16:00"},
     "PM": {"start": "16:00", "end": "@close"},
-    "Close": {"start": "16:00", "end": "@close+35"},
+    "Close": {"start": "@close", "end": "@close+35"},
 }
 
 BUSINESS_HOURS: Dict[str, Dict[str, str]] = {

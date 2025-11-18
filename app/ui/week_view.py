@@ -477,7 +477,7 @@ class WeekSchedulePage(QWidget):
         self.selected_shift_id = None
         self.refresh_shifts()
 
-    def _delete_shift(self, shift_id: int) -> None:
+    def _delete_shift(self, shift_id: int, *, refresh: bool = True) -> bool:
         try:
             with self.session_factory() as session:
                 delete_shift(session, shift_id)
@@ -490,21 +490,32 @@ class WeekSchedulePage(QWidget):
                 )
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Unable to delete shift", str(exc))
-            return
-        self.selected_shift_id = None
-        self.refresh_shifts()
+            return False
+        if refresh:
+            self.selected_shift_id = None
+            self.refresh_shifts()
+        return True
 
     def _handle_delete_shift(self) -> None:
-        if not self.can_edit or not self.selected_shift_id:
+        if not self.can_edit or not self.selected_shift_ids:
             return
+        targets = list(self.selected_shift_ids)
+        count = len(targets)
+        prompt = "Remove the selected shift?" if count == 1 else f"Remove {count} selected shifts?"
         confirm = QMessageBox.question(
             self,
             "Delete shift",
-            "Remove the selected shift?",
+            prompt,
         )
         if confirm != QMessageBox.Yes:
             return
-        self._delete_shift(self.selected_shift_id)
+        deleted_any = False
+        for shift_id in targets:
+            deleted_any |= self._delete_shift(shift_id, refresh=False)
+        if deleted_any:
+            self.selected_shift_id = None
+            self.selected_shift_ids = []
+            self.refresh_shifts()
 
     def _swap_selected_shifts(self) -> None:
         if not (self.can_edit and self.week_start):
@@ -711,7 +722,7 @@ class WeekSchedulePage(QWidget):
         editable = self.can_edit and self.week_start is not None
         selected_count = len(self.selected_shift_ids)
         self.edit_button.setEnabled(editable and selected_count == 1)
-        self.delete_button.setEnabled(editable and selected_count == 1)
+        self.delete_button.setEnabled(editable and selected_count >= 1)
         self.swap_button.setEnabled(editable and selected_count == 2)
         self.grant_button.setEnabled(editable and selected_count >= 1)
         self._update_selection_hint()
@@ -759,7 +770,7 @@ class WeekSchedulePage(QWidget):
             owner_label = owner or "Unassigned shift"
             text = f"{owner_label} selected. Use Edit/Delete or Grant to reassign."
         elif selected_count == 2:
-            text = "Two shifts selected. Click Swap owners to trade assignments or Grant to reassign both."
+            text = "Two shifts selected. Delete removes both; Swap trades owners; Grant reassigns them together."
         else:
-            text = f"{selected_count} shifts selected. Grant shifts will update them together."
+            text = f"{selected_count} shifts selected. Delete clears them or use Grant to reassign."
         self.selection_hint.setText(text)

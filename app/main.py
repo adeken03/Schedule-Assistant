@@ -17,6 +17,7 @@ from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
     QDateEdit,
@@ -53,23 +54,28 @@ from database import (
     EmployeeUnavailability,
     Modifier,
     Policy,
+    SavedModifier,
     SessionLocal,
     WeekContext,
     WeekDailyProjection,
+    apply_saved_modifier_to_week,
+    delete_policy,
+    delete_saved_modifier,
+    get_active_policy,
     get_all_employees,
     get_all_weeks,
     get_or_create_week_context,
+    get_policies,
     get_shifts_for_week,
     get_week_daily_projections,
     get_week_modifiers,
     get_week_summary,
-    get_policies,
-    upsert_policy,
-    delete_policy,
-    get_active_policy,
-    set_week_status,
     init_database,
+    list_saved_modifiers,
     save_week_daily_projection_values,
+    save_modifier_template,
+    set_week_status,
+    upsert_policy,
 )
 
 from exporter import DATA_DIR as EXPORT_DIR, export_week
@@ -354,6 +360,14 @@ QTableView {
 QTableWidget::item,
 QTableView::item {
     padding: 6px;
+    border: none;
+}
+
+QTableWidget::item:selected,
+QTableView::item:selected {
+    background-color: #f5b942;
+    color: #0b0b0f;
+    border: 1px solid #fadd6b;
 }
 
 QHeaderView::section {
@@ -385,6 +399,15 @@ QListWidget::item,
 QListView::item,
 QTreeView::item {
     padding: 6px 10px;
+    border-radius: 6px;
+}
+
+QListWidget::item:selected,
+QListView::item:selected,
+QTreeView::item:selected {
+    background-color: #f5b942;
+    color: #0b0b0f;
+    border: 1px solid #fadd6b;
 }
 
 QScrollArea {
@@ -1007,11 +1030,6 @@ class WeekSelectorWidget(QWidget):
         self.week_combo.currentIndexChanged.connect(self._handle_combo_change)
         layout.addWidget(self.week_combo)
 
-        self.week_date = QDateEdit()
-        self.week_date.setCalendarPopup(True)
-        self.week_date.setDisplayFormat("yyyy-MM-dd")
-        layout.addWidget(self.week_date)
-
         self.apply_button = QPushButton("Select week")
         self.apply_button.clicked.connect(self._handle_apply_clicked)
         layout.addWidget(self.apply_button)
@@ -1042,11 +1060,6 @@ class WeekSelectorWidget(QWidget):
                 selected_index = idx
         self.week_combo.setCurrentIndex(selected_index)
         self._updating = False
-        self._update_date_edit()
-
-    def _update_date_edit(self) -> None:
-        start = week_start_date(self.active_week["iso_year"], self.active_week["iso_week"])
-        self.week_date.setDate(QDate(start.year, start.month, start.day))
 
     def _handle_combo_change(self) -> None:
         if self._updating:
@@ -1057,13 +1070,15 @@ class WeekSelectorWidget(QWidget):
         iso_year, iso_week = data
         label = self.week_combo.currentText()
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
-        self._update_date_edit()
         if self.on_change:
             self.on_change(iso_year, iso_week, label)
 
     def _handle_apply_clicked(self) -> None:
-        qdate = self.week_date.date()
-        selected_date = datetime.date(qdate.year(), qdate.month(), qdate.day())
+        start = week_start_date(self.active_week["iso_year"], self.active_week["iso_week"])
+        dialog = WeekPickerDialog(start, parent=self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        selected_date = dialog.selected_date()
         iso_year, iso_week, _ = selected_date.isocalendar()
         label = week_label(iso_year, iso_week)
         with self.session_factory() as session:
@@ -1072,6 +1087,32 @@ class WeekSelectorWidget(QWidget):
         self.set_active_week({"iso_year": iso_year, "iso_week": iso_week, "label": label})
         if self.on_change:
             self.on_change(iso_year, iso_week, label)
+
+
+class WeekPickerDialog(QDialog):
+    def __init__(self, default_date: datetime.date, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Select week")
+        self.resize(360, 360)
+        layout = QVBoxLayout(self)
+        hint = QLabel("Pick any date within the target week.")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        if default_date:
+            self.calendar.setSelectedDate(QDate(default_date.year, default_date.month, default_date.day))
+        layout.addWidget(self.calendar)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def selected_date(self) -> datetime.date:
+        qdate = self.calendar.selectedDate()
+        return datetime.date(qdate.year(), qdate.month(), qdate.day())
 
 
 class ValidationImportExportPage(QWidget):
@@ -1569,6 +1610,9 @@ class ModifierDialog(QDialog):
 
         layout.addLayout(form)
 
+        self.save_checkbox = QCheckBox("Save this modifier for future weeks")
+        layout.addWidget(self.save_checkbox)
+
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{ERROR_COLOR};")
         layout.addWidget(self.feedback_label)
@@ -1586,6 +1630,7 @@ class ModifierDialog(QDialog):
         self.sign_combo.setCurrentIndex(0 if modifier.pct_change >= 0 else 1)
         self.pct_input.setValue(abs(modifier.pct_change))
         self.notes_input.setText(modifier.notes or "")
+        self.save_checkbox.setChecked(False)
 
     def _build_time_combo(self) -> QComboBox:
         combo = QComboBox()
@@ -1662,6 +1707,7 @@ class ModifierDialog(QDialog):
             "end_time": end_value,
             "pct_change": pct_change,
             "notes": self.notes_input.text().strip(),
+            "save_for_later": self.save_checkbox.isChecked(),
         }
         super().accept()
 
@@ -1676,6 +1722,7 @@ class DemandPlanningWidget(QWidget):
         self.week_label: str = active_week.get("label", "")
         self.projections: List[WeekDailyProjection] = []
         self.modifiers: List[Modifier] = []
+        self.saved_modifiers: List[SavedModifier] = []
         self.day_inputs: Dict[int, QLineEdit] = {}
         self.day_note_inputs: Dict[int, QLineEdit] = {}
         self.heat_labels: Dict[int, QLabel] = {}
@@ -1814,11 +1861,47 @@ class DemandPlanningWidget(QWidget):
         self.delete_modifier_button = QPushButton("Delete")
         self.delete_modifier_button.clicked.connect(self.handle_delete_modifier)
         modifier_buttons.addWidget(self.delete_modifier_button)
+
+        self.save_modifier_button = QPushButton("Save for later")
+        self.save_modifier_button.clicked.connect(self.handle_save_modifier_template)
+        modifier_buttons.addWidget(self.save_modifier_button)
         modifier_buttons.addStretch()
         modifier_layout.addLayout(modifier_buttons)
 
         layout.addWidget(self.modifier_group)
+        layout.addWidget(self._build_saved_modifier_library())
         layout.addStretch(1)
+
+    def _build_saved_modifier_library(self) -> QGroupBox:
+        self.saved_modifier_group = QGroupBox("Saved modifiers")
+        library_layout = QVBoxLayout(self.saved_modifier_group)
+        hint = QLabel("Double-click a saved modifier to drop it into the active week.")
+        hint.setWordWrap(True)
+        library_layout.addWidget(hint)
+
+        self.saved_modifier_list = QListWidget()
+        self.saved_modifier_list.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.saved_modifier_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.saved_modifier_list.itemSelectionChanged.connect(self._update_saved_modifier_buttons)
+        self.saved_modifier_list.itemDoubleClicked.connect(lambda _: self.handle_apply_saved_modifier())
+        library_layout.addWidget(self.saved_modifier_list)
+
+        saved_buttons = QHBoxLayout()
+        self.apply_saved_button = QPushButton("Add to week")
+        self.apply_saved_button.clicked.connect(self.handle_apply_saved_modifier)
+        saved_buttons.addWidget(self.apply_saved_button)
+
+        self.delete_saved_button = QPushButton("Delete saved")
+        self.delete_saved_button.clicked.connect(self.handle_delete_saved_modifier)
+        saved_buttons.addWidget(self.delete_saved_button)
+        saved_buttons.addStretch()
+        library_layout.addLayout(saved_buttons)
+
+        self.saved_feedback_label = QLabel()
+        self.saved_feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
+        library_layout.addWidget(self.saved_feedback_label)
+        self._update_saved_modifier_buttons()
+        return self.saved_modifier_group
 
     def _heat_label_style(self, background: Optional[str] = None) -> str:
         base_bg = background or "#10131b"
@@ -1842,8 +1925,10 @@ class DemandPlanningWidget(QWidget):
             self.week_label = week.label
             self.projections = get_week_daily_projections(session, week.id)
             self.modifiers = get_week_modifiers(session, week.id)
+            self.saved_modifiers = list_saved_modifiers(session)
         self._populate_projection_inputs()
         self._refresh_modifiers_table()
+        self._refresh_saved_modifier_panel()
         self._apply_heatmap()
         self._update_group_titles()
         self._update_modifier_buttons()
@@ -2114,6 +2199,131 @@ class DemandPlanningWidget(QWidget):
         has_selection = self._selected_modifier() is not None
         self.edit_modifier_button.setEnabled(has_selection)
         self.delete_modifier_button.setEnabled(has_selection)
+        self.save_modifier_button.setEnabled(has_selection)
+
+    def _selected_saved_modifier(self) -> Optional[SavedModifier]:
+        if not hasattr(self, "saved_modifier_list"):
+            return None
+        row = self.saved_modifier_list.currentRow()
+        if row < 0 or row >= len(self.saved_modifiers):
+            return None
+        return self.saved_modifiers[row]
+
+    def _update_saved_modifier_buttons(self) -> None:
+        has_selection = self._selected_saved_modifier() is not None
+        for button in (self.apply_saved_button, self.delete_saved_button):
+            button.setEnabled(has_selection)
+
+    def _refresh_saved_modifier_panel(self) -> None:
+        if not hasattr(self, "saved_modifier_list"):
+            return
+        self.saved_modifier_list.clear()
+        for template in self.saved_modifiers:
+            day_text = DAYS_OF_WEEK[template.day_of_week]
+            window_text = f"{format_time_label(template.start_time)}–{format_time_label(template.end_time)}"
+            change_text = f"{template.pct_change:+d}%"
+            label = f"{template.title}  ({day_text} {window_text}, {change_text})"
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, template.id)
+            self.saved_modifier_list.addItem(item)
+        self._update_saved_modifier_buttons()
+
+    def handle_save_modifier_template(self) -> None:
+        current = self._selected_modifier()
+        if not current:
+            return
+        self._create_saved_template(
+            title=current.title,
+            impact_type=current.modifier_type,
+            day_of_week=current.day_of_week,
+            start_time=current.start_time,
+            end_time=current.end_time,
+            pct_change=current.pct_change,
+            notes=current.notes or "",
+        )
+        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
+        self.modifier_feedback.setText(f"Saved '{current.title}' for future weeks.")
+        self.refresh()
+
+    def handle_apply_saved_modifier(self) -> None:
+        template = self._selected_saved_modifier()
+        if not template or self.week_id is None:
+            return
+        with self.session_factory() as session:
+            try:
+                modifier = apply_saved_modifier_to_week(
+                    session,
+                    template.id,
+                    self.week_id,
+                    created_by=self.actor.get("username", "unknown"),
+                )
+            except ValueError:
+                QMessageBox.warning(self, "Saved modifier missing", "That saved modifier no longer exists.")
+                self.refresh()
+                return
+        audit_logger.log(
+            "modifier_create_from_saved",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={"template_id": template.id, "modifier_id": modifier.id},
+        )
+        self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
+        self.modifier_feedback.setText(f"Added '{template.title}' to {self.week_label}.")
+        self.refresh()
+
+    def handle_delete_saved_modifier(self) -> None:
+        template = self._selected_saved_modifier()
+        if not template:
+            return
+        confirm = QMessageBox.question(
+            self,
+            "Delete saved modifier",
+            f"Remove '{template.title}' from the saved list?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        with self.session_factory() as session:
+            delete_saved_modifier(session, template.id)
+        audit_logger.log(
+            "modifier_template_delete",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={"template_id": template.id, "title": template.title},
+        )
+        self.saved_feedback_label.setText(f"Deleted saved modifier '{template.title}'.")
+        self.refresh()
+
+    def _create_saved_template(
+        self,
+        *,
+        title: str,
+        impact_type: str,
+        day_of_week: int,
+        start_time: datetime.time,
+        end_time: datetime.time,
+        pct_change: int,
+        notes: str,
+    ) -> None:
+        with self.session_factory() as session:
+            template = save_modifier_template(
+                session,
+                title=title,
+                modifier_type=impact_type,
+                day_of_week=day_of_week,
+                start_time=start_time,
+                end_time=end_time,
+                pct_change=pct_change,
+                notes=notes,
+                created_by=self.actor.get("username", "unknown"),
+            )
+        audit_logger.log(
+            "modifier_template_create",
+            self.actor.get("username"),
+            role=self.actor.get("role"),
+            details={"template_id": template.id, "title": template.title},
+        )
+        if hasattr(self, "saved_feedback_label"):
+            self.saved_feedback_label.setText(f"Saved '{title}' for future weeks.")
 
     def handle_add_modifier(self) -> None:
         dialog = ModifierDialog(self.modifiers)
@@ -2121,16 +2331,20 @@ class DemandPlanningWidget(QWidget):
         if dialog.exec() != QDialog.Accepted or not dialog.result_data or self.week_id is None:
             return
         data = dialog.result_data
+        pct_change = int(data["pct_change"])
+        impact_type = "increase" if pct_change >= 0 else "decrease"
+        day_value = int(data["day_of_week"])
+        notes_value = data.get("notes", "")
         with self.session_factory() as session:
             modifier = Modifier(
                 week_id=self.week_id,
                 title=data["title"],
-                modifier_type="increase" if int(data["pct_change"]) >= 0 else "decrease",
-                day_of_week=int(data["day_of_week"]),
+                modifier_type=impact_type,
+                day_of_week=day_value,
                 start_time=data["start_time"],
                 end_time=data["end_time"],
-                pct_change=int(data["pct_change"]),
-                notes=data.get("notes", ""),
+                pct_change=pct_change,
+                notes=notes_value,
                 created_by=self.actor.get("username", "unknown"),
             )
             session.add(modifier)
@@ -2153,6 +2367,16 @@ class DemandPlanningWidget(QWidget):
         )
         self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.modifier_feedback.setText(f"Added modifier '{modifier.title}'.")
+        if data.get("save_for_later"):
+            self._create_saved_template(
+                title=data["title"],
+                impact_type=impact_type,
+                day_of_week=day_value,
+                start_time=data["start_time"],
+                end_time=data["end_time"],
+                pct_change=pct_change,
+                notes=notes_value,
+            )
         self.refresh()
 
     def handle_edit_modifier(self) -> None:
@@ -2164,7 +2388,10 @@ class DemandPlanningWidget(QWidget):
         if dialog.exec() != QDialog.Accepted or not dialog.result_data:
             return
         data = dialog.result_data
-        impact_type = "increase" if int(data["pct_change"]) >= 0 else "decrease"
+        pct_change = int(data["pct_change"])
+        impact_type = "increase" if pct_change >= 0 else "decrease"
+        day_value = int(data["day_of_week"])
+        notes_value = data.get("notes", "")
         with self.session_factory() as session:
             modifier = session.get(Modifier, current.id)
             if not modifier:
@@ -2173,11 +2400,11 @@ class DemandPlanningWidget(QWidget):
                 return
             modifier.title = data["title"]
             modifier.modifier_type = impact_type
-            modifier.day_of_week = int(data["day_of_week"])
+            modifier.day_of_week = day_value
             modifier.start_time = data["start_time"]
             modifier.end_time = data["end_time"]
-            modifier.pct_change = int(data["pct_change"])
-            modifier.notes = data.get("notes", "")
+            modifier.pct_change = pct_change
+            modifier.notes = notes_value
             session.commit()
         audit_logger.log(
             "modifier_update",
@@ -2188,14 +2415,24 @@ class DemandPlanningWidget(QWidget):
                 "week_id": self.week_id,
                 "title": data["title"],
                 "modifier_type": impact_type,
-                "day_of_week": int(data["day_of_week"]),
+                "day_of_week": day_value,
                 "start_time": data["start_time"].isoformat(),
                 "end_time": data["end_time"].isoformat(),
-                "pct_change": int(data["pct_change"]),
+                "pct_change": pct_change,
             },
         )
         self.modifier_feedback.setStyleSheet(f"color:{SUCCESS_COLOR};")
         self.modifier_feedback.setText(f"Updated modifier '{data['title']}'.")
+        if data.get("save_for_later"):
+            self._create_saved_template(
+                title=data["title"],
+                impact_type=impact_type,
+                day_of_week=day_value,
+                start_time=data["start_time"],
+                end_time=data["end_time"],
+                pct_change=pct_change,
+                notes=notes_value,
+            )
         self.refresh()
 
     def handle_delete_modifier(self) -> None:
@@ -3913,21 +4150,15 @@ class MainWindow(QMainWindow):
             manage_accounts_button.clicked.connect(self.open_account_manager)
             footer_row.addWidget(manage_accounts_button)
 
-        self.policy_library_button = QPushButton("Policy library")
-        self.policy_library_button.clicked.connect(self.open_policy_manager)
-        self.policy_editor_button = QPushButton("Edit active policy")
-        self.policy_editor_button.clicked.connect(self.open_active_policy_editor)
+        self.policy_button = QPushButton("View policy")
+        self.policy_button.clicked.connect(self.open_policy_manager)
 
         if self.user_role in {"IT", "GM"}:
-            footer_row.addWidget(self.policy_library_button)
-            footer_row.addWidget(self.policy_editor_button)
+            footer_row.addWidget(self.policy_button)
         elif SHOW_POLICY_TO_SM and self.user_role == "SM":
-            footer_row.addWidget(self.policy_library_button)
-            self.policy_library_button.setEnabled(False)
-            self.policy_editor_button.setVisible(False)
+            footer_row.addWidget(self.policy_button)
         else:
-            self.policy_library_button.setEnabled(False)
-            self.policy_editor_button.setVisible(False)
+            self.policy_button.setEnabled(False)
 
         change_password_button = QPushButton("Change password")
         change_password_button.clicked.connect(self.open_change_password)
@@ -4109,35 +4340,6 @@ class MainWindow(QMainWindow):
         dialog = PolicyDialog(self.session_factory, self.user, read_only=read_only)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
-
-    def open_active_policy_editor(self) -> None:
-        if self.user_role not in {"GM", "IT"}:
-            self.open_policy_manager()
-            return
-        with self.session_factory() as session:
-            policy = get_active_policy(session)
-        dialog = PolicyComposerDialog(
-            name=policy.name if policy else "",
-            params=policy.params_dict() if policy else None,
-        )
-        dialog.setStyleSheet(THEME_STYLESHEET)
-        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
-            return
-        data = dialog.result_data
-        with self.session_factory() as session:
-            saved = upsert_policy(
-                session,
-                data["name"],
-                data["params"],
-                edited_by=self.user.get("username", "system"),
-            )
-        audit_logger.log(
-            "policy_update",
-            self.user.get("username", "unknown"),
-            role=self.user.get("role"),
-            details={"policy_id": saved.id, "name": saved.name},
-        )
-        QMessageBox.information(self, "Policy saved", f"Policy '{saved.name}' updated.")
 
     def handle_logout(self) -> None:
         confirm = QMessageBox.question(self, "Sign out", "Return to sign-in screen?")

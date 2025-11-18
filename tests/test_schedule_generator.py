@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import datetime
 import sys
 from pathlib import Path
@@ -97,9 +98,9 @@ class ScheduleGeneratorTests(unittest.TestCase):
         self.assertIn(closer.id, monday_ids)
 
     def test_threshold_rules_add_additional_staff(self) -> None:
-        policy = self._policy(daily_boost={"Mon": 1})
-        policy["roles"]["Server"]["blocks"]["Open"]["base"] = 1
-        policy["roles"]["Server"]["blocks"]["Open"]["max"] = 2
+        policy = self._policy(block_names=["Mid"], daily_boost={"Mon": 1})
+        policy["roles"]["Server"]["blocks"]["Mid"]["base"] = 1
+        policy["roles"]["Server"]["blocks"]["Mid"]["max"] = 2
         policy["roles"]["Server"]["thresholds"] = [{"metric": "demand_index", "gte": 0.5, "add": 1}]
         self._seed_sales({0: 1000.0, 1: 100.0})
         first = self._add_employee("Primary", ["Server"], desired_hours=40)
@@ -110,6 +111,54 @@ class ScheduleGeneratorTests(unittest.TestCase):
         monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
         assigned = [shift for shift in monday if shift.employee_id in {first.id, second.id}]
         self.assertGreaterEqual(len(assigned), 2)
+
+    def test_open_block_limited_to_core_roles(self) -> None:
+        block_windows = {
+            "Open": ("10:30", "11:00"),
+            "Mid": ("11:00", "16:00"),
+            "PM": ("16:00", "21:00"),
+            "Close": ("21:00", "21:35"),
+        }
+        policy = self._policy_template(block_windows, ["Kitchen Opener", "Bartender", "Server - Dining", "Cashier"])
+        for role in policy["roles"].values():
+            role["blocks"]["Open"]["base"] = 1
+            role["blocks"]["Open"]["min"] = 1
+            role["blocks"]["Open"]["max"] = 1
+        self._add_employee("Kitchen Lead", ["Kitchen Opener"], desired_hours=40)
+        self._add_employee("Morning Bartender", ["Bartender"], desired_hours=40)
+        self._add_employee("Lead Server", ["Server - Dining"], desired_hours=40)
+        self._add_employee("Front Counter", ["Cashier"], desired_hours=40)
+
+        self._run_generator(policy)
+
+        monday_shifts = self._shifts_for_day(0)
+        openers = [
+            shift
+            for shift in monday_shifts
+            if shift.start.astimezone().time() < datetime.time(11, 0)
+        ]
+        self.assertEqual(len(openers), 3)
+        self.assertSetEqual(
+            {shift.role for shift in openers},
+            {"Kitchen Opener", "Bartender", "Server - Dining"},
+        )
+
+    def test_close_block_starts_at_close_time(self) -> None:
+        block_windows = {"Close": ("22:00", "22:35")}
+        policy = self._policy_template(block_windows, ["Server"])
+        policy["roles"]["Server"]["blocks"]["Close"]["base"] = 1
+        policy["roles"]["Server"]["blocks"]["Close"]["min"] = 1
+        policy["roles"]["Server"]["blocks"]["Close"]["max"] = 1
+        self._add_employee("Closer", ["Server"], desired_hours=32)
+
+        self._run_generator(policy)
+
+        monday_shifts = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
+        self.assertTrue(monday_shifts)
+        start_times = {shift.start.astimezone().time() for shift in monday_shifts}
+        self.assertEqual(start_times, {datetime.time(22, 0)})
+        end_times = {shift.end.astimezone().time() for shift in monday_shifts}
+        self.assertIn(datetime.time(22, 35), end_times)
 
     # Helpers -----------------------------------------------------------------
 
@@ -128,6 +177,7 @@ class ScheduleGeneratorTests(unittest.TestCase):
         block_names = block_names or ["Open"]
         timeblocks = {
             "Open": {"start": "09:00", "end": "13:00"},
+            "Mid": {"start": "11:00", "end": "16:00"},
             "Close": {"start": "16:00", "end": "22:00"},
         }
         role_blocks = {
@@ -158,6 +208,38 @@ class ScheduleGeneratorTests(unittest.TestCase):
         if global_overrides:
             policy["global"].update(global_overrides)
         return policy
+
+    def _policy_template(self, block_windows: dict[str, tuple[str, str]], role_names: list[str]) -> dict:
+        timeblocks = {
+            name: {"start": start, "end": end}
+            for name, (start, end) in block_windows.items()
+        }
+        role_blocks = {
+            block_name: {"base": 0, "min": 0, "max": 1, "per_1000_sales": 0.0, "per_modifier": 0.0}
+            for block_name in block_windows
+        }
+        roles_payload = {}
+        for role_name in role_names:
+            roles_payload[role_name] = {
+                "enabled": True,
+                "priority": 1.0,
+                "max_weekly_hours": 40,
+                "daily_boost": {},
+                "blocks": copy.deepcopy(role_blocks),
+            }
+        return {
+            "global": {
+                "max_hours_week": 40,
+                "min_rest_hours": 10,
+                "max_consecutive_days": 7,
+                "round_to_minutes": 15,
+                "allow_split_shifts": True,
+                "desired_hours_floor_pct": 0.85,
+                "desired_hours_ceiling_pct": 1.15,
+            },
+            "timeblocks": timeblocks,
+            "roles": roles_payload,
+        }
 
     def _add_employee(
         self,

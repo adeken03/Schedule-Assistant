@@ -288,6 +288,9 @@ class ScheduleGenerator:
                     continue
                 block_targets = role_cfg.get("blocks") or {}
                 for block_name, block_cfg in block_targets.items():
+                    block_label = (block_name or "").strip().lower()
+                    if block_label == "open" and not self._role_allows_open_shift(role_name):
+                        continue
                     resolved = resolve_policy_block(self.policy, block_name, date_value)
                     if not resolved:
                         continue
@@ -346,6 +349,7 @@ class ScheduleGenerator:
         block_name: str,
         day_index: int,
     ) -> int:
+        block_label = (block_name or "").strip().lower()
         base = int(block_cfg.get("base", block_cfg.get("min", 0)))
         min_staff = int(block_cfg.get("min", base))
         max_staff = max(int(block_cfg.get("max", max(base, min_staff))), min_staff)
@@ -359,6 +363,10 @@ class ScheduleGenerator:
         daily_boost = int(boosts.get(day_token, 0))
         need = base + sales_component + modifier_component + daily_boost
         need += self._threshold_adjustment(role_cfg, block_cfg, day_index)
+        if block_label == "open":
+            if not self._role_allows_open_shift(role_name):
+                return 0
+            need = 1 if need > 0 else 0
         need = max(min_staff, need)
         if max_staff > 0:
             need = min(max_staff, need)
@@ -373,6 +381,20 @@ class ScheduleGenerator:
         if not normalized_role:
             return False
         return "opener" in normalized_role
+
+    def _role_allows_open_shift(self, role_name: str) -> bool:
+        normalized_role = normalize_role(role_name)
+        if not normalized_role:
+            return False
+        allowed = {
+            "kitchen opener",
+            "bartender",
+            "bartender - opener",
+            "server",
+            "server - dining",
+            "server - dining opener",
+        }
+        return normalized_role in allowed
 
     def _is_closer_block(self, role_name: str, block_name: str) -> bool:
         normalized_role = normalize_role(role_name)

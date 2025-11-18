@@ -174,6 +174,28 @@ class Modifier(Base):
     week: Mapped[WeekContext] = relationship(back_populates="modifiers")
 
 
+class SavedModifier(Base):
+    __tablename__ = "saved_modifiers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    title: Mapped[str] = mapped_column(String(80), nullable=False)
+    modifier_type: Mapped[str] = mapped_column(String(24), nullable=False, default="increase")
+    day_of_week: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    start_time: Mapped[datetime.time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[datetime.time] = mapped_column(Time, nullable=False)
+    pct_change: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    notes: Mapped[str] = mapped_column(String(200), nullable=False, default="")
+    created_by: Mapped[str] = mapped_column(String(60), nullable=False, default="system")
+    created_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True), default=datetime.datetime.now(datetime.timezone.utc)
+    )
+    updated_at: Mapped[datetime.datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=datetime.datetime.now(datetime.timezone.utc),
+        onupdate=datetime.datetime.now(datetime.timezone.utc),
+    )
+
+
 class Policy(Base):
     __tablename__ = "policies"
 
@@ -382,6 +404,71 @@ def get_week_modifiers(session, week_id: int) -> List[Modifier]:
         .order_by(Modifier.day_of_week, Modifier.start_time, Modifier.id)
     )
     return list(session.scalars(stmt))
+
+
+def list_saved_modifiers(session) -> List[SavedModifier]:
+    stmt = select(SavedModifier).order_by(SavedModifier.title.asc(), SavedModifier.id.asc())
+    return list(session.scalars(stmt))
+
+
+def save_modifier_template(
+    session,
+    *,
+    title: str,
+    modifier_type: str,
+    day_of_week: int,
+    start_time: datetime.time,
+    end_time: datetime.time,
+    pct_change: int,
+    notes: str,
+    created_by: str,
+) -> SavedModifier:
+    template = SavedModifier(
+        title=title,
+        modifier_type=modifier_type if modifier_type in {"increase", "decrease"} else "increase",
+        day_of_week=max(0, min(day_of_week, 6)),
+        start_time=start_time,
+        end_time=end_time,
+        pct_change=pct_change,
+        notes=notes or "",
+        created_by=created_by,
+    )
+    session.add(template)
+    session.commit()
+    session.refresh(template)
+    return template
+
+
+def delete_saved_modifier(session, template_id: int) -> None:
+    session.query(SavedModifier).filter(SavedModifier.id == template_id).delete()
+    session.commit()
+
+
+def apply_saved_modifier_to_week(
+    session,
+    template_id: int,
+    week_id: int,
+    *,
+    created_by: str,
+) -> Modifier:
+    template = session.get(SavedModifier, template_id)
+    if not template:
+        raise ValueError("Saved modifier not found.")
+    modifier = Modifier(
+        week_id=week_id,
+        title=template.title,
+        modifier_type=template.modifier_type,
+        day_of_week=template.day_of_week,
+        start_time=template.start_time,
+        end_time=template.end_time,
+        pct_change=template.pct_change,
+        notes=template.notes,
+        created_by=created_by,
+    )
+    session.add(modifier)
+    session.commit()
+    session.refresh(modifier)
+    return modifier
 
 
 def get_policies(session) -> List[Policy]:
