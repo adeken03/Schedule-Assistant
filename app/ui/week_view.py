@@ -29,15 +29,19 @@ from PySide6.QtWidgets import (
 from database import (
     Shift,
     delete_shift,
+    get_or_create_week_context,
     get_shifts_for_week,
+    get_week_daily_projections,
     get_week_summary,
     list_employees,
     list_roles,
     record_audit_log,
+    shift_display_date,
     upsert_shift,
 )
 from generator.api import generate_schedule_for_week
 from policy import load_active_policy, role_catalog
+from wages import validate_wages
 from roles import grouped_roles, is_manager_role, palette_for_role, role_group, role_matches
 from ui.edit_shift import EditShiftDialog
 
@@ -71,6 +75,7 @@ class WeekSchedulePage(QWidget):
         self.current_shifts: List[Dict] = []
         self.filtered_shifts: List[Dict] = []
         self.summary_data: Dict = {}
+        self.group_breakdown: Dict[str, Dict[str, float]] = {}
         self.selected_shift_id: Optional[int] = None
         self.selected_shift_ids: List[int] = []
         self.selected_day_index: int = 0
@@ -189,8 +194,11 @@ class WeekSchedulePage(QWidget):
             self.summary_labels.append(label)
             summary_layout.addWidget(label, 0, idx)
         self.week_total_label = QLabel("Week total - 0 shifts - $0.00")
+        self.group_breakdown_label = QLabel("Role group spend vs budget will appear here.")
+        self.group_breakdown_label.setWordWrap(True)
         footer.addWidget(summary_box)
         footer.addWidget(self.week_total_label)
+        footer.addWidget(self.group_breakdown_label)
 
         controls = QHBoxLayout()
         controls.setSpacing(10)
@@ -221,6 +229,11 @@ class WeekSchedulePage(QWidget):
         self.grant_button.clicked.connect(self._grant_shifts)
         controls.addWidget(self.grant_button)
 
+        self.manager_cover_button = QPushButton("Manager cover")
+        self.manager_cover_button.setToolTip("Mark the selected shift as covered by a manager (zero labor cost).")
+        self.manager_cover_button.clicked.connect(self._handle_manager_cover)
+        controls.addWidget(self.manager_cover_button)
+
         self.back_button = QPushButton("Back")
         self.back_button.clicked.connect(lambda: self.on_back() if self.on_back else None)
         controls.addWidget(self.back_button)
@@ -248,6 +261,7 @@ class WeekSchedulePage(QWidget):
 
     def refresh_shifts(self) -> None:
         if not self.week_start:
+            self.group_breakdown = {}
             return
         employee_id = self.employee_filter.currentData() or None
         selected_role = self.role_filter.currentData()
@@ -265,7 +279,11 @@ class WeekSchedulePage(QWidget):
                 status=status_value,
             )
             self.summary_data = get_week_summary(session, self.week_start)
+            iso_year, iso_week, _ = self.week_start.isocalendar()
+            context = get_or_create_week_context(session, iso_year, iso_week, f"{iso_year} W{iso_week:02d}")
+            projections = get_week_daily_projections(session, context.id)
         self.current_shifts = [shift for shift in shifts if not is_manager_role(shift.get("role"))]
+        self.group_breakdown = self._build_group_breakdown(shifts, projections)
         self._sync_selected_ids()
         if selected_group:
             allowed_roles = set(self._roles_by_group.get(selected_group, []))
@@ -359,11 +377,9 @@ class WeekSchedulePage(QWidget):
     def _render_shift_grid(self) -> None:
         by_day: Dict[int, List[Dict]] = {idx: [] for idx in range(7)}
         for shift in self.filtered_shifts:
-            start = shift.get("start")
-            if not isinstance(start, datetime.datetime):
+            day_index = self._shift_day_index_from_data(shift)
+            if day_index is None:
                 continue
-            local_start = start.astimezone()
-            day_index = local_start.weekday()
             by_day.setdefault(day_index, []).append(shift)
 
         selected_set = set(self.selected_shift_ids)
@@ -401,7 +417,34 @@ class WeekSchedulePage(QWidget):
             label.setText(f"{DAY_NAMES[idx]}\nShifts: {count}\nCost: ${cost:,.2f}")
         total_cost = self.summary_data.get("total_cost", 0.0) if self.summary_data else 0.0
         total_shifts = self.summary_data.get("total_shifts", 0) if self.summary_data else 0
-        self.week_total_label.setText(f"Week total - {total_shifts} shifts - ${total_cost:,.2f}")
+        projected_sales = self.summary_data.get("projected_sales_total", 0.0) if self.summary_data else 0.0
+        policy_pct = self._policy_labor_pct()
+        projected_budget = projected_sales * policy_pct if projected_sales > 0 and policy_pct > 0 else 0.0
+        if projected_budget > 0:
+            policy_usage = f"{min(999.9, (total_cost / projected_budget) * 100):.1f}%"
+        else:
+            policy_usage = "--"
+        if projected_sales > 0:
+            sales_usage = f"{min(999.9, (total_cost / projected_sales) * 100):.1f}%"
+        else:
+            sales_usage = "--"
+        self.week_total_label.setText(
+            f"Week total - {total_shifts} shifts - ${total_cost:,.2f} "
+            f"- Projected {policy_usage} of Policy Labor Budget - Projected {sales_usage} of Projected Sales"
+        )
+        breakdown_parts: List[str] = []
+        display_order = ["Heart of House", "Servers", "Bartenders", "Cashier & Takeout"]
+        for group in display_order:
+            payload = self.group_breakdown.get(group, {})
+            budget = payload.get("budget", 0.0)
+            spend = payload.get("spend", 0.0)
+            pct = "--"
+            if budget > 0:
+                pct = f"{min(999.9, (spend / budget) * 100):.1f}%"
+            breakdown_parts.append(f"{group}: {pct} (${spend:,.0f} / ${budget:,.0f})")
+        self.group_breakdown_label.setText(
+            "Role group spend vs budget: " + " | ".join(breakdown_parts) if breakdown_parts else "Role group spend vs budget: --"
+        )
 
     def _format_shift_text(self, shift: Dict) -> str:
         start = shift.get("start").astimezone()
@@ -586,9 +629,82 @@ class WeekSchedulePage(QWidget):
             message += f" Skipped {skipped} shift(s) due to role mismatch."
         QMessageBox.information(self, "Grant shifts", message)
 
+    def _manager_candidates(self) -> List[Dict]:
+        return [
+            entry
+            for entry in self.employee_options
+            if any(is_manager_role(role) for role in (entry.get("roles") or []))
+        ]
+
+    def _handle_manager_cover(self) -> None:
+        if not (self.can_edit and self.week_start):
+            return
+        if not self.selected_shift_ids:
+            QMessageBox.information(self, "Manager cover", "Select at least one shift.")
+            return
+        candidates = self._manager_candidates()
+        manager_id = None
+        manager_name = "Manager"
+        if candidates:
+            names = [entry["name"] for entry in candidates]
+            choice, ok = QInputDialog.getItem(
+                self,
+                "Manager cover",
+                "Which manager will cover this shift?",
+                names,
+                editable=False,
+            )
+            if not ok:
+                return
+            for entry in candidates:
+                if entry["name"] == choice:
+                    manager_id = entry["id"]
+                    manager_name = entry["name"]
+                    break
+        else:
+            proceed = QMessageBox.question(
+                self,
+                "Manager cover",
+                "No managers are stored in the directory. Mark selected shifts as manager-covered with no wage?",
+            )
+            if proceed != QMessageBox.Yes:
+                return
+
+        with self.session_factory() as session:
+            for shift_id in self.selected_shift_ids:
+                shift = session.get(Shift, shift_id)
+                if not shift:
+                    continue
+                shift.employee_id = manager_id
+                shift.labor_rate = 0.0
+                shift.labor_cost = 0.0
+                note = shift.notes or ""
+                tag = "Manager cover"
+                if note and tag.lower() not in note.lower():
+                    note = f"{note.rstrip('.')}. {tag}"
+                elif not note:
+                    note = tag
+                shift.notes = note
+            session.commit()
+            record_audit_log(
+                session,
+                self.user.get("username", "unknown"),
+                "manager_cover",
+                target_type="Shift",
+                target_id=self.selected_shift_ids[0],
+                payload={"manager_id": manager_id, "count": len(self.selected_shift_ids)},
+            )
+        self.refresh_all()
+        assigned_label = f"{len(self.selected_shift_ids)} shift(s) marked for manager cover"
+        if manager_id:
+            assigned_label += f" by {manager_name}"
+        QMessageBox.information(self, "Manager cover", assigned_label + ".")
+
     def _handle_generate(self) -> None:
         if not self.week_start:
             QMessageBox.information(self, "Select week", "Choose a week before running the generator.")
+            return
+        if not self._pre_generation_checks():
             return
         confirm = QMessageBox.question(
             self,
@@ -614,6 +730,50 @@ class WeekSchedulePage(QWidget):
             f"Created {result.get('shifts_created', 0)} shifts.\n{details}",
         )
 
+    def _pre_generation_checks(self) -> bool:
+        with self.session_factory() as session:
+            employees = list_employees(session, only_active=True)
+        self.employee_options = employees
+        if not employees:
+            QMessageBox.warning(
+                self,
+                "No employees",
+                "Add active employees from Week Prep → Employee directory before generating a schedule.",
+            )
+            return False
+        roles_needed = sorted({role for entry in employees for role in entry.get("roles", []) if role})
+        if not roles_needed:
+            QMessageBox.warning(
+                self,
+                "No roles",
+                "Assign at least one role to each employee before generating a schedule.",
+            )
+            return False
+        wage_issues = validate_wages(roles_needed)
+        if wage_issues:
+            bullet = "\n".join(f"• {role}: {reason}" for role, reason in sorted(wage_issues.items()))
+            QMessageBox.warning(
+                self,
+                "Missing wages",
+                "Set and confirm hourly wages for each role from Week Prep → Role wages:\n\n" + bullet,
+            )
+            return False
+        iso_year, iso_week, _ = self.week_start.isocalendar()
+        label = f"{iso_year} W{iso_week:02d}"
+        with self.session_factory() as session:
+            week_context = get_or_create_week_context(session, iso_year, iso_week, label)
+            projections = get_week_daily_projections(session, week_context.id)
+        missing_days = [DAY_NAMES[item.day_of_week] for item in projections if (item.projected_sales_amount or 0) <= 0]
+        if missing_days:
+            readable = ", ".join(missing_days)
+            QMessageBox.warning(
+                self,
+                "Missing projections",
+                f"Enter projected sales for each day (Week Prep → Projected sales). Missing days: {readable}.",
+            )
+            return False
+        return True
+
     def _gather_selected_shift_ids(self) -> List[int]:
         selected: List[int] = []
         for column in self.day_columns:
@@ -623,10 +783,24 @@ class WeekSchedulePage(QWidget):
                     selected.append(shift_id)
         return selected
 
+    def _shift_day_index_from_data(self, shift: Dict) -> Optional[int]:
+        if not self.week_start:
+            return None
+        start = shift.get("start")
+        if not isinstance(start, datetime.datetime):
+            return None
+        display_day = shift_display_date(start, shift.get("location"))
+        delta = (display_day - self.week_start).days
+        if 0 <= delta < 7:
+            return delta
+        return None
+
     def _day_index_for_shift(self, shift_id: int) -> int:
         shift = self._shift_by_id(shift_id)
-        if shift and isinstance(shift.get("start"), datetime.datetime):
-            return shift["start"].astimezone().weekday()
+        if shift:
+            day_index = self._shift_day_index_from_data(shift)
+            if day_index is not None:
+                return day_index
         return 0
 
     def _sync_selected_ids(self) -> None:
@@ -643,6 +817,64 @@ class WeekSchedulePage(QWidget):
             if shift["id"] == shift_id:
                 return shift
         return None
+
+    def _policy_labor_pct(self) -> float:
+        global_cfg = self.policy.get("global", {}) if isinstance(self.policy, dict) else {}
+        pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
+        if pct > 1.0:
+            pct /= 100.0
+        return max(0.0, min(0.9, pct))
+
+    @staticmethod
+    def _display_group_name(group: str) -> str:
+        if group in {"Kitchen", "Heart of House"}:
+            return "Heart of House"
+        if group in {"Cashier & Takeout", "Cashier"}:
+            return "Cashier & Takeout"
+        return group or "Other"
+
+    def _role_group_from_policy(self, role: Optional[str]) -> str:
+        if not role:
+            return "Other"
+        cfg = (self.policy.get("roles", {}) or {}).get(role, {})
+        if isinstance(cfg, dict):
+            explicit = cfg.get("group")
+            if explicit:
+                return str(explicit)
+        return role_group(role)
+
+    def _build_group_breakdown(self, shifts: List[Dict], projections) -> Dict[str, Dict[str, float]]:
+        budgets: Dict[str, float] = {}
+        labor_pct = self._policy_labor_pct()
+        role_groups_cfg = self.policy.get("role_groups", {}) if isinstance(self.policy, dict) else {}
+        for projection in projections or []:
+            sales = float(getattr(projection, "projected_sales_amount", 0.0) or 0.0)
+            day_budget = sales * labor_pct
+            for group_name, spec in role_groups_cfg.items():
+                pct = spec.get("allocation_pct", 0.0)
+                try:
+                    pct = float(pct)
+                except (TypeError, ValueError):
+                    pct = 0.0
+                if pct > 1.0:
+                    pct /= 100.0
+                if pct <= 0:
+                    continue
+                display_group = self._display_group_name(group_name)
+                budgets[display_group] = budgets.get(display_group, 0.0) + (day_budget * pct)
+
+        spend: Dict[str, float] = {}
+        for shift in shifts:
+            group_name = self._display_group_name(self._role_group_from_policy(shift.get("role")))
+            spend[group_name] = spend.get(group_name, 0.0) + float(shift.get("labor_cost") or 0.0)
+
+        breakdown: Dict[str, Dict[str, float]] = {}
+        for group in set(list(budgets.keys()) + list(spend.keys())):
+            breakdown[group] = {
+                "budget": round(budgets.get(group, 0.0), 2),
+                "spend": round(spend.get(group, 0.0), 2),
+            }
+        return breakdown
 
     def _choose_employee(self) -> Optional[Dict]:
         if not self.employee_options:
@@ -725,6 +957,7 @@ class WeekSchedulePage(QWidget):
         self.delete_button.setEnabled(editable and selected_count >= 1)
         self.swap_button.setEnabled(editable and selected_count == 2)
         self.grant_button.setEnabled(editable and selected_count >= 1)
+        self.manager_cover_button.setEnabled(editable and selected_count >= 1)
         self._update_selection_hint()
 
     def _enforce_permissions(self) -> None:

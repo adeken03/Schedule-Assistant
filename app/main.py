@@ -59,13 +59,11 @@ from database import (
     WeekContext,
     WeekDailyProjection,
     apply_saved_modifier_to_week,
-    delete_policy,
     delete_saved_modifier,
     get_active_policy,
     get_all_employees,
     get_all_weeks,
     get_or_create_week_context,
-    get_policies,
     get_shifts_for_week,
     get_week_daily_projections,
     get_week_modifiers,
@@ -86,13 +84,24 @@ from data_exchange import (
     export_week_projections,
     export_week_schedule,
     get_weeks_summary,
+    export_role_wages_dataset,
+    import_role_wages_dataset,
     import_employees,
     import_week_modifiers,
     import_week_projections,
     import_week_schedule,
 )
-from policy import ensure_default_policy
-from roles import ROLE_GROUPS
+from policy import build_default_policy, ensure_default_policy
+from wages import (
+    baseline_wages,
+    export_wages as export_wages_file,
+    import_wages as import_wages_file,
+    load_wages,
+    reset_wages_to_defaults,
+    save_wages,
+    validate_wages,
+)
+from roles import ROLE_GROUPS, role_group
 from ui.week_view import WeekSchedulePage
 
 
@@ -1174,6 +1183,7 @@ class ValidationImportExportPage(QWidget):
         self.dataset_combo.addItem("Week projections", "projections")
         self.dataset_combo.addItem("Week modifiers", "modifiers")
         self.dataset_combo.addItem("Week schedule", "shifts")
+        self.dataset_combo.addItem("Role wages", "wages")
         self.dataset_combo.currentIndexChanged.connect(self._update_button_states)
 
         dataset_form = QFormLayout()
@@ -1486,6 +1496,8 @@ class ValidationImportExportPage(QWidget):
         self.feedback_label.repaint()
 
     def _export_dataset(self, dataset: str) -> Optional[Path]:
+        if dataset == "wages":
+            return export_role_wages_dataset()
         with self.session_factory() as session:
             if dataset == "employees":
                 return export_employees(session)
@@ -1504,6 +1516,9 @@ class ValidationImportExportPage(QWidget):
         return None
 
     def _import_dataset(self, dataset: str, path: Path) -> Dict[str, int]:
+        if dataset == "wages":
+            count = import_role_wages_dataset(path)
+            return {"roles": count}
         with self.session_factory() as session:
             if dataset == "employees":
                 created, updated = import_employees(session, path)
@@ -1816,6 +1831,9 @@ class DemandPlanningWidget(QWidget):
             heat_row.addWidget(label)
         heat_row.addStretch()
         heat_layout.addLayout(heat_row)
+        self.sales_total_label = QLabel("Projected weekly sales: --")
+        self.sales_total_label.setStyleSheet("font-weight:600;")
+        heat_layout.addWidget(self.sales_total_label)
 
         layout.addWidget(self.heat_group)
 
@@ -2112,6 +2130,10 @@ class DemandPlanningWidget(QWidget):
             label.setText(
                 f"{DAYS_OF_WEEK[day]}\n{self._format_currency(adjusted)}\n{self._format_delta(delta)}"
             )
+        projected_total = sum(adjusted_values)
+        self.sales_total_label.setText(
+            f"Projected weekly sales (after modifiers): {self._format_currency(projected_total)}"
+        )
 
     @staticmethod
     def _modifier_fraction_within_day(start: datetime.time, end: datetime.time) -> float:
@@ -2504,6 +2526,7 @@ def _default_role_payload(block_names: List[str]) -> Dict[str, Any]:
         "max_weekly_hours": 35,
         "daily_boost": {},
         "thresholds": [],
+        "covers": [],
         "blocks": {
             block: {"base": 0, "min": 0, "max": 0, "per_1000_sales": 0.0, "per_modifier": 0.0}
             for block in block_names
@@ -2513,13 +2536,13 @@ def _default_role_payload(block_names: List[str]) -> Dict[str, Any]:
 
 def _default_business_hours() -> Dict[str, Dict[str, str]]:
     return {
-        "Mon": {"open": "11:00", "close": "24:00"},
-        "Tue": {"open": "11:00", "close": "24:00"},
-        "Wed": {"open": "11:00", "close": "24:00"},
-        "Thu": {"open": "11:00", "close": "24:00"},
-        "Fri": {"open": "11:00", "close": "25:00"},
-        "Sat": {"open": "11:00", "close": "25:00"},
-        "Sun": {"open": "11:00", "close": "23:00"},
+        "Mon": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+        "Tue": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+        "Wed": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+        "Thu": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+        "Fri": {"open": "11:00", "mid": "16:00", "close": "25:00"},
+        "Sat": {"open": "11:00", "mid": "16:00", "close": "25:00"},
+        "Sun": {"open": "11:00", "mid": "16:00", "close": "23:00"},
     }
 
 
@@ -2532,6 +2555,7 @@ class PolicyComposerDialog(QDialog):
         self.policy_payload = self._initial_policy(params or {})
         self.role_models = self.policy_payload["roles"]
         self.current_role: Optional[str] = None
+        self.role_group_inputs: Dict[str, Dict[str, Any]] = {}
 
         layout = QVBoxLayout(self)
         self.name_input = QLineEdit(name or self.policy_payload.get("name", "Default Policy"))
@@ -2562,6 +2586,7 @@ class PolicyComposerDialog(QDialog):
     def _initial_policy(self, params: Dict[str, Any]) -> Dict[str, Any]:
         timeblocks = _timeblocks_from_params(params)
         block_names = [row["name"] for row in timeblocks]
+        default_role_groups = build_default_policy().get("role_groups", {})
         roles_payload: Dict[str, Any] = {}
         existing_roles = params.get("roles") if isinstance(params, dict) else {}
         if not isinstance(existing_roles, dict):
@@ -2577,6 +2602,15 @@ class PolicyComposerDialog(QDialog):
             payload.setdefault("max_weekly_hours", 35)
             payload.setdefault("daily_boost", {})
             payload.setdefault("thresholds", [])
+            if not isinstance(payload.get("covers"), list):
+                payload["covers"] = []
+            group_name = payload.get("group") or role_group(role)
+            payload["group"] = group_name
+            if "allow_cuts" not in payload:
+                payload["allow_cuts"] = not ("bartend" in group_name.lower())
+            if "always_on" not in payload:
+                payload["always_on"] = "bartend" in group_name.lower()
+            payload.setdefault("cut_buffer_minutes", 30)
             blocks = payload.get("blocks")
             if not isinstance(blocks, dict):
                 blocks = {}
@@ -2594,17 +2628,18 @@ class PolicyComposerDialog(QDialog):
             "description": params.get("description", ""),
             "global": params.get("global")
             if isinstance(params.get("global"), dict)
-            else {
-                "max_hours_week": 40,
-                "min_rest_hours": 10,
-                "max_consecutive_days": 6,
-                "round_to_minutes": 15,
-                "allow_split_shifts": True,
-                "desired_hours_floor_pct": 0.85,
-                "desired_hours_ceiling_pct": 1.15,
-                "open_buffer_minutes": 30,
-                "close_buffer_minutes": 35,
-            },
+                else {
+                    "max_hours_week": 40,
+                    "max_consecutive_days": 6,
+                    "round_to_minutes": 15,
+                    "allow_split_shifts": True,
+                    "desired_hours_floor_pct": 0.85,
+                    "desired_hours_ceiling_pct": 1.15,
+                    "open_buffer_minutes": 30,
+                    "close_buffer_minutes": 35,
+                    "labor_budget_pct": 0.27,
+                    "labor_budget_tolerance_pct": 0.08,
+                },
             "timeblocks": timeblocks,
             "business_hours": (
                 params.get("business_hours")
@@ -2612,6 +2647,11 @@ class PolicyComposerDialog(QDialog):
                 else _default_business_hours()
             ),
             "roles": roles_payload,
+            "role_groups": (
+                params.get("role_groups")
+                if isinstance(params.get("role_groups"), dict)
+                else default_role_groups
+            ),
         }
 
     def _build_global_tab(self) -> QWidget:
@@ -2623,10 +2663,6 @@ class PolicyComposerDialog(QDialog):
         self.max_hours_spin.setRange(10, 80)
         self.max_hours_spin.setValue(int(global_cfg.get("max_hours_week", 40)))
 
-        self.min_rest_spin = QSpinBox()
-        self.min_rest_spin.setRange(1, 24)
-        self.min_rest_spin.setValue(int(global_cfg.get("min_rest_hours", 10)))
-
         self.max_consec_spin = QSpinBox()
         self.max_consec_spin.setRange(1, 7)
         self.max_consec_spin.setValue(int(global_cfg.get("max_consecutive_days", 6)))
@@ -2635,6 +2671,24 @@ class PolicyComposerDialog(QDialog):
         self.round_minutes_spin.setRange(5, 60)
         self.round_minutes_spin.setValue(int(global_cfg.get("round_to_minutes", 15)))
 
+        self.labor_budget_spin = QDoubleSpinBox()
+        self.labor_budget_spin.setRange(5.0, 60.0)
+        self.labor_budget_spin.setDecimals(1)
+        self.labor_budget_spin.setSuffix("%")
+        labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
+        if labor_pct <= 1:
+            labor_pct *= 100
+        self.labor_budget_spin.setValue(labor_pct)
+
+        self.labor_tolerance_spin = QDoubleSpinBox()
+        self.labor_tolerance_spin.setRange(0.0, 30.0)
+        self.labor_tolerance_spin.setDecimals(1)
+        self.labor_tolerance_spin.setSuffix("%")
+        tolerance_pct = float(global_cfg.get("labor_budget_tolerance_pct", 0.08) or 0.0)
+        if tolerance_pct <= 1:
+            tolerance_pct *= 100
+        self.labor_tolerance_spin.setValue(tolerance_pct)
+
         intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -2642,9 +2696,8 @@ class PolicyComposerDialog(QDialog):
         guardrails_box = QGroupBox("Scheduling guardrails")
         guard_form = QFormLayout(guardrails_box)
         guard_form.addRow("Max hours per week", self.max_hours_spin)
-        guard_form.addRow("Min rest hours", self.min_rest_spin)
         guard_form.addRow("Max consecutive days", self.max_consec_spin)
-        guard_form.addRow("Merge shifts within (minutes)", self.round_minutes_spin)
+        guard_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
         layout.addWidget(guardrails_box)
 
         hours_box = QGroupBox("Operating hours")
@@ -2692,13 +2745,10 @@ class PolicyComposerDialog(QDialog):
         desired_form.addRow(desired_note)
         layout.addWidget(desired_box)
 
-        self.split_checkbox = QCheckBox("Allow split shifts (return later the same day)")
-        self.split_checkbox.setChecked(bool(global_cfg.get("allow_split_shifts", True)))
         split_note = QLabel("Disable this if you only want one continuous shift per person each day.")
         split_note.setWordWrap(True)
         shift_box = QGroupBox("Shift behavior")
         shift_layout = QVBoxLayout(shift_box)
-        shift_layout.addWidget(self.split_checkbox)
         buffer_form = QFormLayout()
         self.open_buffer_spin = QSpinBox()
         self.open_buffer_spin.setRange(0, 120)
@@ -2711,6 +2761,53 @@ class PolicyComposerDialog(QDialog):
         shift_layout.addLayout(buffer_form)
         shift_layout.addWidget(split_note)
         layout.addWidget(shift_box)
+
+        budget_box = QGroupBox("Labor budget")
+        budget_form = QFormLayout(budget_box)
+        budget_form.addRow("Labor budget (% of projected sales)", self.labor_budget_spin)
+        budget_form.addRow("Allowed variance (±%)", self.labor_tolerance_spin)
+        layout.addWidget(budget_box)
+
+        labor_box = QGroupBox("Role group labor allocations")
+        labor_form = QFormLayout(labor_box)
+        groups_spec = self.policy_payload.get("role_groups") or build_default_policy().get("role_groups", {})
+        for group_name in sorted(groups_spec.keys()):
+            spec = groups_spec.get(group_name, {})
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            pct_spin = QDoubleSpinBox()
+            pct_spin.setRange(0.0, 100.0)
+            pct_spin.setDecimals(1)
+            pct_spin.setSuffix("%")
+            allocation = spec.get("allocation_pct", 0.0)
+            try:
+                allocation = float(allocation)
+            except (TypeError, ValueError):
+                allocation = 0.0
+            pct_spin.setValue(allocation * 100 if allocation <= 1 else allocation)
+            allow_cuts_box = QCheckBox("Allow cuts")
+            allow_cuts_box.setChecked(bool(spec.get("allow_cuts", True)))
+            always_on_box = QCheckBox("Always staffed")
+            always_on_box.setChecked(bool(spec.get("always_on", False)))
+            cut_spin = QSpinBox()
+            cut_spin.setRange(0, 180)
+            cut_spin.setValue(int(spec.get("cut_buffer_minutes", 30) or 0))
+            row_layout.addWidget(pct_spin)
+            row_layout.addWidget(allow_cuts_box)
+            row_layout.addWidget(always_on_box)
+            row_layout.addWidget(QLabel("Cut buffer (min)"))
+            row_layout.addWidget(cut_spin)
+            row_layout.addStretch(1)
+            labor_form.addRow(group_name, row_widget)
+            self.role_group_inputs[group_name] = {
+                "pct": pct_spin,
+                "allow_cuts": allow_cuts_box,
+                "always_on": always_on_box,
+                "cut_buffer": cut_spin,
+            }
+        layout.addWidget(labor_box)
+
         layout.addStretch(1)
         return widget
 
@@ -2829,6 +2926,16 @@ class PolicyComposerDialog(QDialog):
             daily_layout.addWidget(QLabel(day), 0, idx)
             daily_layout.addWidget(spin, 1, idx)
         detail_layout.addWidget(daily_box)
+
+        cover_box = QGroupBox("Can cover these roles when short")
+        cover_layout = QVBoxLayout(cover_box)
+        cover_hint = QLabel("Checked roles become last-priority fallbacks when no dedicated staff are available.")
+        cover_hint.setWordWrap(True)
+        cover_layout.addWidget(cover_hint)
+        self.cover_roles_list = QListWidget()
+        cover_layout.addWidget(self.cover_roles_list)
+        detail_layout.addWidget(cover_box)
+
         detail_layout.addStretch()
 
         layout.addWidget(self.role_list, 1)
@@ -2921,6 +3028,8 @@ class PolicyComposerDialog(QDialog):
             spin.blockSignals(False)
         self._populate_role_block_table()
         self._populate_threshold_table()
+        covers = data.get("covers") or []
+        self._populate_cover_roles_list(covers)
 
     def _populate_role_block_table(self) -> None:
         if not self.current_role:
@@ -2971,6 +3080,18 @@ class PolicyComposerDialog(QDialog):
             self.threshold_table.setItem(row, 2, QTableWidgetItem(str(int(add))))
         self.threshold_table.blockSignals(False)
 
+    def _populate_cover_roles_list(self, covers: List[str]) -> None:
+        self.cover_roles_list.blockSignals(True)
+        self.cover_roles_list.clear()
+        for role in ROLE_CATALOG:
+            if role == self.current_role:
+                continue
+            item = QListWidgetItem(role)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if role in covers else Qt.Unchecked)
+            self.cover_roles_list.addItem(item)
+        self.cover_roles_list.blockSignals(False)
+
     def _read_threshold_rows(self) -> List[Dict[str, float | int | str]]:
         rows: List[Dict[str, float | int | str]] = []
         for row in range(self.threshold_table.rowCount()):
@@ -3012,6 +3133,12 @@ class PolicyComposerDialog(QDialog):
         for stale in [name for name in list(blocks.keys()) if name not in block_names]:
             blocks.pop(stale, None)
         data["thresholds"] = self._read_threshold_rows()
+        covers: List[str] = []
+        for idx in range(self.cover_roles_list.count()):
+            item = self.cover_roles_list.item(idx)
+            if item.checkState() == Qt.Checked:
+                covers.append(item.text())
+        data["covers"] = covers
 
     def _parse_table_int(self, item: Optional[QTableWidgetItem]) -> int:
         if not item:
@@ -3076,20 +3203,33 @@ class PolicyComposerDialog(QDialog):
         self.policy_payload["description"] = self.description_input.text().strip()
         self.policy_payload["global"] = {
             "max_hours_week": self.max_hours_spin.value(),
-            "min_rest_hours": self.min_rest_spin.value(),
             "max_consecutive_days": self.max_consec_spin.value(),
             "round_to_minutes": self.round_minutes_spin.value(),
-            "allow_split_shifts": self.split_checkbox.isChecked(),
+            "allow_split_shifts": True,
             "desired_hours_floor_pct": round(self.desired_floor_spin.value() / 100, 3),
             "desired_hours_ceiling_pct": round(self.desired_ceiling_spin.value() / 100, 3),
             "open_buffer_minutes": self.open_buffer_spin.value(),
             "close_buffer_minutes": self.close_buffer_spin.value(),
+            "labor_budget_pct": round(self.labor_budget_spin.value() / 100, 4),
+            "labor_budget_tolerance_pct": round(self.labor_tolerance_spin.value() / 100, 4),
         }
         timeblock_rows = self._read_timeblocks()
         self.policy_payload["timeblocks"] = [
             {"name": row["name"], "start": row["start"], "end": row["end"]} for row in timeblock_rows
         ]
         self.policy_payload["business_hours"] = self._read_business_hours()
+        role_groups_payload: Dict[str, Dict[str, Any]] = {}
+        for group_name, widgets in self.role_group_inputs.items():
+            pct_value = max(0.0, widgets["pct"].value())
+            allocation = pct_value / 100.0
+            role_groups_payload[group_name] = {
+                "allocation_pct": round(allocation, 4),
+                "allow_cuts": widgets["allow_cuts"].isChecked(),
+                "always_on": widgets["always_on"].isChecked(),
+                "cut_buffer_minutes": widgets["cut_buffer"].value(),
+            }
+        if role_groups_payload:
+            self.policy_payload["role_groups"] = role_groups_payload
         params = {
             "description": self.policy_payload.get("description", ""),
             "global": self.policy_payload["global"],
@@ -3098,6 +3238,7 @@ class PolicyComposerDialog(QDialog):
             },
             "business_hours": self.policy_payload["business_hours"],
             "roles": self.role_models,
+            "role_groups": self.policy_payload.get("role_groups", {}),
         }
         self.result_data = {"name": name, "params": params}
         super().accept()
@@ -3109,162 +3250,384 @@ class PolicyDialog(QDialog):
         self.session_factory = session_factory
         self.current_user = current_user
         self.read_only = read_only
-        self.setWindowTitle("Policies")
-        self.resize(1100, 640)
-        self.policies: List[Policy] = []
+        self.setWindowTitle("Policy settings")
+        self.resize(1100, 720)
+        self.policy: Optional[Policy] = None
+        self.policy_data: Dict[str, Any] = {}
+        self.role_group_widgets: Dict[str, Dict[str, QWidget]] = {}
         self._build_ui()
-        self._load_policies()
+        self._load_policy()
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        intro = QLabel("Manage the store scheduling policies. Use Add or Edit to open the GM-friendly settings view.")
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["ID", "Name", "Parameters", "Last Edited By", "Last Edited At"])
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        layout.addWidget(self.table)
+        name_form = QFormLayout()
+        self.name_input = QLineEdit()
+        self.description_input = QLineEdit()
+        name_form.addRow("Policy name", self.name_input)
+        name_form.addRow("Description", self.description_input)
+        layout.addLayout(name_form)
+
+        global_box = QGroupBox("Global guardrails")
+        global_form = QFormLayout(global_box)
+        self.max_hours_spin = QSpinBox()
+        self.max_hours_spin.setRange(10, 80)
+        self.max_consec_spin = QSpinBox()
+        self.max_consec_spin.setRange(1, 7)
+        self.round_minutes_spin = QSpinBox()
+        self.round_minutes_spin.setRange(5, 60)
+        self.desired_floor_spin = QDoubleSpinBox()
+        self.desired_floor_spin.setDecimals(1)
+        self.desired_floor_spin.setSuffix("%")
+        self.desired_floor_spin.setRange(0.0, 150.0)
+        self.desired_ceiling_spin = QDoubleSpinBox()
+        self.desired_ceiling_spin.setDecimals(1)
+        self.desired_ceiling_spin.setSuffix("%")
+        self.desired_ceiling_spin.setRange(50.0, 250.0)
+        self.desired_floor_spin.valueChanged.connect(self._sync_desired_range_bounds)
+        self.desired_ceiling_spin.valueChanged.connect(self._sync_desired_range_bounds)
+        self.open_buffer_spin = QSpinBox()
+        self.open_buffer_spin.setRange(0, 120)
+        self.close_buffer_spin = QSpinBox()
+        self.close_buffer_spin.setRange(0, 240)
+        global_form.addRow("Max hours per week", self.max_hours_spin)
+        global_form.addRow("Max consecutive days", self.max_consec_spin)
+        global_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
+        global_form.addRow("Desired hours min%", self.desired_floor_spin)
+        global_form.addRow("Desired hours max%", self.desired_ceiling_spin)
+        global_form.addRow("Open buffer (minutes)", self.open_buffer_spin)
+        global_form.addRow("Close buffer (minutes)", self.close_buffer_spin)
+        layout.addWidget(global_box)
+
+        labor_box = QGroupBox("Labor budget")
+        labor_form = QFormLayout(labor_box)
+        self.labor_budget_spin = QDoubleSpinBox()
+        self.labor_budget_spin.setRange(5.0, 60.0)
+        self.labor_budget_spin.setDecimals(1)
+        self.labor_budget_spin.setSuffix("%")
+        self.labor_tolerance_spin = QDoubleSpinBox()
+        self.labor_tolerance_spin.setRange(0.0, 30.0)
+        self.labor_tolerance_spin.setDecimals(1)
+        self.labor_tolerance_spin.setSuffix("%")
+        labor_form.addRow("Labor budget (% of projected sales)", self.labor_budget_spin)
+        labor_form.addRow("Allowed variance (±%)", self.labor_tolerance_spin)
+        layout.addWidget(labor_box)
+
+        time_box = QGroupBox("Daily windows")
+        time_layout = QVBoxLayout(time_box)
+        hours_note = QLabel("Set open/close per day. Morning/Evening blocks are derived from these hours plus buffers.")
+        hours_note.setWordWrap(True)
+        time_layout.addWidget(hours_note)
+        self.hours_table = QTableWidget(len(WEEKDAY_LABELS), 4)
+        self.hours_table.setHorizontalHeaderLabels(["Day", "Opens at", "AM end", "Closes at"])
+        self.hours_table.verticalHeader().setVisible(False)
+        self.hours_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.hours_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.hours_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        self.hours_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Stretch)
+        business_hours = self.policy_data.get("business_hours") or _default_business_hours()
+        timeblocks = self.policy_data.get("timeblocks") or {}
+        pm_block = timeblocks.get("PM") or timeblocks.get("Mid") or {"start": "16:00"}
+        for row, day in enumerate(WEEKDAY_LABELS):
+            day_item = QTableWidgetItem(day)
+            day_item.setFlags(Qt.ItemIsEnabled)
+            entry = business_hours.get(day, {})
+            open_item = QTableWidgetItem(entry.get("open", "11:00"))
+            close_item = QTableWidgetItem(entry.get("close", "23:00"))
+            am_end = pm_block.get("start", "16:00")
+            am_item = QTableWidgetItem(am_end)
+            self.hours_table.setItem(row, 0, day_item)
+            self.hours_table.setItem(row, 1, open_item)
+            self.hours_table.setItem(row, 2, am_item)
+            self.hours_table.setItem(row, 3, close_item)
+        time_layout.addWidget(self.hours_table)
+        layout.addWidget(time_box)
+
+        groups_box = QGroupBox("Role-group allocations")
+        groups_layout = QVBoxLayout(groups_box)
+        self.role_group_table = QTableWidget(len(ROLE_GROUPS), 2)
+        self.role_group_table.setHorizontalHeaderLabels(["Group", "Allocation %"])
+        self.role_group_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.role_group_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        self.role_group_table.verticalHeader().setVisible(False)
+        groups_layout.addWidget(self.role_group_table)
+        layout.addWidget(groups_box)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
         layout.addWidget(self.feedback_label)
 
         buttons = QHBoxLayout()
-        self.add_button = QPushButton("Add")
-        self.edit_button = QPushButton("Edit")
-        self.delete_button = QPushButton("Delete")
-        self.close_button = QPushButton("Close")
-        self.add_button.clicked.connect(self.handle_add)
-        self.edit_button.clicked.connect(self.handle_edit)
-        self.delete_button.clicked.connect(self.handle_delete)
-        self.close_button.clicked.connect(self.reject)
-        buttons.addWidget(self.add_button)
-        buttons.addWidget(self.edit_button)
-        buttons.addWidget(self.delete_button)
+        self.save_button = QPushButton("Save policy")
+        self.save_button.clicked.connect(self._save_policy)
+        buttons.addWidget(self.save_button)
+        self.export_button = QPushButton("Export…")
+        self.export_button.clicked.connect(self._export_policy)
+        buttons.addWidget(self.export_button)
+        self.import_button = QPushButton("Import…")
+        self.import_button.clicked.connect(self._import_policy)
+        buttons.addWidget(self.import_button)
         buttons.addStretch()
-        buttons.addWidget(self.close_button)
+        close_button = QPushButton("Close")
+        close_button.clicked.connect(self.reject)
+        buttons.addWidget(close_button)
         layout.addLayout(buttons)
 
         if self.read_only:
-            self.add_button.setEnabled(False)
-            self.edit_button.setEnabled(False)
-            self.delete_button.setEnabled(False)
+            for widget in [
+                self.name_input,
+                self.description_input,
+                self.max_hours_spin,
+                self.max_consec_spin,
+                self.round_minutes_spin,
+                self.desired_floor_spin,
+                self.desired_ceiling_spin,
+                self.open_buffer_spin,
+                self.close_buffer_spin,
+                self.labor_budget_spin,
+                self.labor_tolerance_spin,
+                self.hours_table,
+                self.role_group_table,
+            ]:
+                widget.setEnabled(False)
+            self.save_button.setEnabled(False)
+            self.export_button.setEnabled(False)
+            self.import_button.setEnabled(False)
 
-        self.table.itemSelectionChanged.connect(self._update_buttons)
-        self.table.cellDoubleClicked.connect(lambda *_: self.handle_edit())
-        self._update_buttons()
-
-    def _update_buttons(self) -> None:
-        has_selection = self.table.currentRow() != -1
-        can_modify = (not self.read_only) and has_selection
-        self.edit_button.setEnabled(can_modify)
-        self.delete_button.setEnabled(can_modify)
-
-    def _load_policies(self) -> None:
+    def _load_policy(self) -> None:
         with self.session_factory() as session:
-            self.policies = get_policies(session)
-        self._refresh_table()
+            self.policy = get_active_policy(session)
+        if self.policy:
+            self.policy_data = self.policy.params_dict()
+            self.policy_data["name"] = self.policy.name
+            self.policy_data["description"] = getattr(self.policy, "description", self.policy_data.get("description", ""))
+        else:
+            self.policy_data = build_default_policy()
+        self._ensure_policy_defaults()
+        self._apply_policy_to_fields()
 
-    def _refresh_table(self) -> None:
-        self.table.setRowCount(len(self.policies))
-        for row, policy in enumerate(self.policies):
-            params = policy.params_dict()
-            summary = ", ".join([f"{k}={v}" for k, v in list(params.items())[:4]])
-            if len(params) > 4:
-                summary += ", …"
-            cells = [
-                QTableWidgetItem(str(policy.id)),
-                QTableWidgetItem(policy.name),
-                QTableWidgetItem(summary),
-                QTableWidgetItem(policy.lastEditedBy or ""),
-                QTableWidgetItem(policy.lastEditedAt.strftime("%Y-%m-%d %H:%M")),
-            ]
-            for col, item in enumerate(cells):
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                self.table.setItem(row, col, item)
+    def _apply_policy_to_fields(self) -> None:
+        self.name_input.setText(self.policy_data.get("name", "Store policy"))
+        self.description_input.setText(self.policy_data.get("description", ""))
+        global_cfg = self.policy_data.get("global", {})
+        self.max_hours_spin.setValue(int(global_cfg.get("max_hours_week", 40)))
+        self.max_consec_spin.setValue(int(global_cfg.get("max_consecutive_days", 6)))
+        self.round_minutes_spin.setValue(int(global_cfg.get("round_to_minutes", 15)))
+        floor = float(global_cfg.get("desired_hours_floor_pct", 0.85) or 0.0) * 100
+        ceil = float(global_cfg.get("desired_hours_ceiling_pct", 1.15) or 0.0) * 100
+        self.desired_floor_spin.setValue(floor)
+        self.desired_ceiling_spin.setValue(max(self.desired_floor_spin.value(), ceil))
+        self.open_buffer_spin.setValue(int(global_cfg.get("open_buffer_minutes", 30)))
+        self.close_buffer_spin.setValue(int(global_cfg.get("close_buffer_minutes", 35)))
+        labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
+        if labor_pct <= 1:
+            labor_pct *= 100
+        self.labor_budget_spin.setValue(labor_pct)
+        labor_tol = float(global_cfg.get("labor_budget_tolerance_pct", 0.08) or 0.0)
+        if labor_tol <= 1:
+            labor_tol *= 100
+        self.labor_tolerance_spin.setValue(labor_tol)
+        self._load_hours_table()
+        self._populate_role_groups()
 
-    def _selected_policy(self) -> Optional[Policy]:
-        row = self.table.currentRow()
-        if row < 0 or row >= len(self.policies):
-            return None
-        return self.policies[row]
+    def _sync_desired_range_bounds(self) -> None:
+        if self.desired_ceiling_spin.value() < self.desired_floor_spin.value():
+            self.desired_ceiling_spin.setValue(self.desired_floor_spin.value())
 
-    def handle_add(self) -> None:
+    def _load_hours_table(self) -> None:
+        hours = self.policy_data.get("business_hours") or _default_business_hours()
+        for row, day in enumerate(WEEKDAY_LABELS):
+            entry = hours.get(day, {})
+            open_value = entry.get("open", "11:00")
+            mid_value = entry.get("mid", entry.get("close", "16:00"))
+            close_value = entry.get("close", "23:00")
+            day_item = QTableWidgetItem(day)
+            day_item.setFlags(Qt.ItemIsEnabled)
+            self.hours_table.setItem(row, 0, day_item)
+            self.hours_table.setItem(row, 1, QTableWidgetItem(open_value))
+            self.hours_table.setItem(row, 2, QTableWidgetItem(mid_value))
+            self.hours_table.setItem(row, 3, QTableWidgetItem(close_value))
+
+    def _read_hours_table(self) -> Dict[str, Dict[str, str]]:
+        hours: Dict[str, Dict[str, str]] = {}
+        for row, day in enumerate(WEEKDAY_LABELS):
+            open_item = self.hours_table.item(row, 1)
+            mid_item = self.hours_table.item(row, 2)
+            close_item = self.hours_table.item(row, 3)
+            open_label = (open_item.text() if open_item else "11:00").strip() or "11:00"
+            mid_label = (mid_item.text() if mid_item else "16:00").strip() or "16:00"
+            close_label = (close_item.text() if close_item else "23:00").strip() or "23:00"
+            hours[day] = {"open": open_label, "mid": mid_label, "close": close_label}
+        return hours
+
+    def _build_timeblocks(self) -> Dict[str, Dict[str, str]]:
+        close_buffer = self.close_buffer_spin.value()
+        return {
+            "Open": {"start": "@open-30", "end": "@open"},
+            "Mid": {"start": "@open", "end": "@mid"},
+            "PM": {"start": "@mid", "end": "@close"},
+            "Close": {"start": "@close", "end": f"@close+{close_buffer}"},
+        }
+
+    def _populate_role_groups(self) -> None:
+        groups_spec = self.policy_data.get("role_groups") or {}
+        self.role_group_widgets.clear()
+        self.role_group_table.setRowCount(len(ROLE_GROUPS))
+        for row, group in enumerate(ROLE_GROUPS.keys()):
+            spec = groups_spec.get(group, {})
+            pct = float(spec.get("allocation_pct", 0.0) or 0.0)
+            if pct <= 1:
+                pct *= 100
+            allocation_spin = QDoubleSpinBox()
+            allocation_spin.setDecimals(1)
+            allocation_spin.setRange(0.0, 100.0)
+            allocation_spin.setSuffix("%")
+            allocation_spin.setValue(pct)
+            self.role_group_table.setItem(row, 0, QTableWidgetItem(group))
+            self.role_group_table.item(row, 0).setFlags(Qt.ItemIsEnabled)
+            self.role_group_table.setCellWidget(row, 1, allocation_spin)
+            self.role_group_widgets[group] = {"pct": allocation_spin}
+            if self.read_only:
+                allocation_spin.setEnabled(False)
+
+    def _read_role_groups(self) -> Dict[str, Dict[str, Any]]:
+        payload: Dict[str, Dict[str, Any]] = {}
+        existing = self.policy_data.get("role_groups", {})
+        for group, widgets in self.role_group_widgets.items():
+            pct_spin: QDoubleSpinBox = widgets["pct"]
+            label_pct = pct_spin.value() / 100.0
+            existing_group = existing.get(group, {})
+            payload[group] = {
+                "allocation_pct": round(label_pct, 4),
+                "allow_cuts": existing_group.get("allow_cuts", True),
+                "cut_buffer_minutes": existing_group.get("cut_buffer_minutes", 0),
+                "always_on": existing_group.get("always_on", False),
+            }
+        return payload
+
+    def _collect_policy_payload(self) -> Dict[str, Any]:
+        name = self.name_input.text().strip() or "Store policy"
+        description = self.description_input.text().strip()
+        params: Dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "global": {
+                "max_hours_week": self.max_hours_spin.value(),
+                "max_consecutive_days": self.max_consec_spin.value(),
+                "round_to_minutes": self.round_minutes_spin.value(),
+                "allow_split_shifts": True,
+                "desired_hours_floor_pct": round(self.desired_floor_spin.value() / 100, 3),
+                "desired_hours_ceiling_pct": round(self.desired_ceiling_spin.value() / 100, 3),
+                "open_buffer_minutes": self.open_buffer_spin.value(),
+                "close_buffer_minutes": self.close_buffer_spin.value(),
+                "labor_budget_pct": round(self.labor_budget_spin.value() / 100, 4),
+                "labor_budget_tolerance_pct": round(self.labor_tolerance_spin.value() / 100, 4),
+            },
+            "timeblocks": self._build_timeblocks(),
+            "business_hours": self._read_hours_table(),
+            "roles": self.policy_data.get("roles") or {},
+            "role_groups": self._read_role_groups(),
+        }
+        return params
+
+    def _save_policy(self) -> None:
         if self.read_only:
             return
-        dialog = PolicyComposerDialog()
-        dialog.setStyleSheet(THEME_STYLESHEET)
-        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
-            return
-        data = dialog.result_data
+        params = self._collect_policy_payload()
+        name = params.pop("name", "Store policy")
         with self.session_factory() as session:
-            policy = upsert_policy(session, data["name"], data["params"], edited_by=self.current_user.get("username", "system"))
-        audit_logger.log(
-            "policy_create",
-            self.current_user.get("username", "unknown"),
-            role=self.current_user.get("role"),
-            details={"policy_id": policy.id, "name": policy.name},
-        )
-        self.feedback_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.feedback_label.setText(f"Added/updated policy '{policy.name}'.")
-        self._load_policies()
-
-    def handle_edit(self) -> None:
-        if self.read_only:
-            return
-        policy = self._selected_policy()
-        if not policy:
-            return
-        dialog = PolicyComposerDialog(name=policy.name, params=policy.params_dict())
-        dialog.setStyleSheet(THEME_STYLESHEET)
-        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
-            return
-        data = dialog.result_data
-        with self.session_factory() as session:
-            updated = upsert_policy(session, data["name"], data["params"], edited_by=self.current_user.get("username", "system"))
+            updated = upsert_policy(session, name, params, edited_by=self.current_user.get("username", "system"))
         audit_logger.log(
             "policy_update",
             self.current_user.get("username", "unknown"),
             role=self.current_user.get("role"),
             details={"policy_id": updated.id, "name": updated.name},
         )
+        self.policy = updated
+        self.policy_data = updated.params_dict()
+        self.policy_data["name"] = updated.name
+        self.policy_data["description"] = getattr(updated, "description", self.policy_data.get("description", ""))
+        self._ensure_policy_defaults()
         self.feedback_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
-        self.feedback_label.setText(f"Updated policy '{updated.name}'.")
-        self._load_policies()
+        self.feedback_label.setText(f"Saved policy '{updated.name}'.")
+        self._apply_policy_to_fields()
 
-    def handle_delete(self) -> None:
+    def _export_policy(self) -> None:
+        if not self.policy_data:
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export policy",
+            str(DATA_DIR / "policy.json"),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        Path(file_path).write_text(json.dumps(self.policy_data, indent=2), encoding="utf-8")
+        QMessageBox.information(self, "Export complete", f"Saved policy to {file_path}.")
+
+    def _import_policy(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import policy",
+            str(DATA_DIR),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            data = json.loads(Path(file_path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError("Invalid policy file.")
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Import failed", str(exc))
+            return
+        self.policy_data = data
+        self._ensure_policy_defaults()
+        self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
+        self.feedback_label.setText(f"Loaded policy from {file_path}. Save to apply.")
+        self._apply_policy_to_fields()
+
+    def _open_composer(self) -> None:
         if self.read_only:
             return
-        policy = self._selected_policy()
-        if not policy:
+        dialog = PolicyComposerDialog(name=self.policy_data.get("name", ""), params=self.policy_data)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        if dialog.exec() != QDialog.Accepted or not dialog.result_data:
             return
-        confirm = QMessageBox.question(
-            self,
-            "Delete policy",
-            f"Remove policy '{policy.name}'?",
-        )
-        if confirm != QMessageBox.Yes:
-            return
+        data = dialog.result_data
         with self.session_factory() as session:
-            delete_policy(session, policy.id)
+            updated = upsert_policy(
+                session,
+                data["name"],
+                data["params"],
+                edited_by=self.current_user.get("username", "system"),
+            )
         audit_logger.log(
-            "policy_delete",
+            "policy_update",
             self.current_user.get("username", "unknown"),
             role=self.current_user.get("role"),
-            details={"policy_id": policy.id, "name": policy.name},
+            details={"policy_id": updated.id, "name": updated.name},
         )
-        self.feedback_label.setStyleSheet(f"color:{ACCENT_COLOR};")
-        self.feedback_label.setText(f"Deleted policy '{policy.name}'.")
-        self._load_policies()
+        self.policy = updated
+        self.policy_data = updated.params_dict()
+        self.policy_data["name"] = updated.name
+        self.policy_data["description"] = getattr(updated, "description", self.policy_data.get("description", ""))
+        self._ensure_policy_defaults()
+        self.feedback_label.setStyleSheet(f"color:{SUCCESS_COLOR};")
+        self.feedback_label.setText(f"Updated policy '{updated.name}'.")
+        self._apply_policy_to_fields()
+    
+    def _ensure_policy_defaults(self) -> None:
+        defaults = build_default_policy()
+        self.policy_data.setdefault("roles", defaults.get("roles", {}))
+        self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
+        hours = self.policy_data.setdefault("business_hours", defaults.get("business_hours", _default_business_hours()))
+        defaults_hours = defaults.get("business_hours", _default_business_hours())
+        for day in WEEKDAY_LABELS:
+            entry = hours.setdefault(day, defaults_hours.get(day, {"open": "11:00", "mid": "16:00", "close": "23:00"}))
+            entry.setdefault("mid", entry.get("close", "16:00"))
+        self.policy_data.setdefault("timeblocks", defaults.get("timeblocks", {}))
 
 
 class EmployeeEditDialog(QDialog):
@@ -3520,6 +3883,165 @@ class EmployeeEditDialog(QDialog):
             "start_year": employee.start_year,
             "start_label": employee.start_date_label,
         }
+        super().accept()
+
+
+class WageManagerDialog(QDialog):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Role wages")
+        self.roles = ROLE_CATALOG
+        self.entries = load_wages()
+        self.wage_inputs: Dict[str, QDoubleSpinBox] = {}
+        self.confirm_boxes: Dict[str, QCheckBox] = {}
+        self.status_items: Dict[str, QTableWidgetItem] = {}
+        self.resize(700, 520)
+        self._build_ui()
+        self._populate_table()
+
+    def _build_ui(self) -> None:
+        layout = QVBoxLayout(self)
+        intro = QLabel("Set each role's hourly wage. Confirmed rows show a green check. Import/export uses JSON files.")
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(len(self.roles), 4)
+        self.table.setHorizontalHeaderLabels(["Status", "Role", "Hourly wage ($)", "Confirmed"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(self.table)
+
+        controls = QHBoxLayout()
+        defaults_button = QPushButton("Reset to defaults")
+        defaults_button.clicked.connect(self._handle_reset)
+        controls.addWidget(defaults_button)
+
+        import_button = QPushButton("Import…")
+        import_button.clicked.connect(self._handle_import)
+        controls.addWidget(import_button)
+
+        export_button = QPushButton("Export…")
+        export_button.clicked.connect(self._handle_export)
+        controls.addWidget(export_button)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+        button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Close)
+        button_box.accepted.connect(self.accept)
+        button_box.rejected.connect(self.reject)
+        layout.addWidget(button_box)
+
+    def _populate_table(self) -> None:
+        self.wage_inputs.clear()
+        self.confirm_boxes.clear()
+        self.status_items.clear()
+        data = load_wages()
+        baseline = baseline_wages()
+        for row, role in enumerate(self.roles):
+            status_item = QTableWidgetItem("")
+            status_item.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 0, status_item)
+            name_item = QTableWidgetItem(role)
+            name_item.setFlags(Qt.ItemIsEnabled)
+            self.table.setItem(row, 1, name_item)
+            spin = QDoubleSpinBox()
+            spin.setPrefix("$")
+            spin.setSuffix("/hr")
+            spin.setRange(0.0, 150.0)
+            spin.setDecimals(2)
+            spin.setSingleStep(0.25)
+            entry = data.get(role, baseline.get(role, {}))
+            spin.setValue(float(entry.get("wage", 0.0) or 0.0))
+            spin.valueChanged.connect(lambda _value, r=role: self._update_status(r))
+            self.table.setCellWidget(row, 2, spin)
+            checkbox = QCheckBox()
+            checkbox.setChecked(bool(entry.get("confirmed", False)))
+            checkbox.stateChanged.connect(lambda _state, r=role: self._update_status(r))
+            container = QWidget()
+            container_layout = QHBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.addStretch()
+            container_layout.addWidget(checkbox)
+            container_layout.addStretch()
+            self.table.setCellWidget(row, 3, container)
+            self.wage_inputs[role] = spin
+            self.confirm_boxes[role] = checkbox
+            self.status_items[role] = status_item
+            self._update_status(role)
+
+    def _update_status(self, role: str) -> None:
+        status_item = self.status_items.get(role)
+        if not status_item:
+            return
+        wage = self.wage_inputs.get(role).value() if role in self.wage_inputs else 0.0
+        confirmed = self.confirm_boxes.get(role).isChecked() if role in self.confirm_boxes else False
+        if wage > 0 and confirmed:
+            status_item.setText("✓")
+            status_item.setForeground(Qt.green)
+        elif wage > 0:
+            status_item.setText("⚠")
+            status_item.setForeground(Qt.yellow)
+        else:
+            status_item.setText("!")
+            status_item.setForeground(Qt.red)
+
+    def _handle_reset(self) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Reset wages",
+            "Reset all wages to the default policy values?",
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        reset_wages_to_defaults()
+        self.entries = load_wages()
+        self._populate_table()
+
+    def _handle_import(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import role wages",
+            str(DATA_DIR),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        try:
+            import_wages_file(Path(file_path))
+        except Exception as exc:  # noqa: BLE001
+            QMessageBox.critical(self, "Import failed", str(exc))
+            return
+        QMessageBox.information(self, "Import complete", "Role wages imported successfully.")
+        self.entries = load_wages()
+        self._populate_table()
+
+    def _handle_export(self) -> None:
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export role wages",
+            str(DATA_DIR / "role_wages.json"),
+            "JSON Files (*.json);;All Files (*)",
+        )
+        if not file_path:
+            return
+        export_wages_file(Path(file_path))
+        QMessageBox.information(self, "Export complete", f"Saved role wages to {file_path}.")
+
+    def accept(self) -> None:  # type: ignore[override]
+        payload: Dict[str, Dict[str, Any]] = {}
+        for role in self.roles:
+            wage = round(self.wage_inputs[role].value(), 2)
+            if wage <= 0.0:
+                QMessageBox.warning(self, "Missing wage", f"Enter a wage for {role} before saving.")
+                return
+            payload[role] = {
+                "wage": wage,
+                "confirmed": self.confirm_boxes[role].isChecked(),
+            }
+        save_wages(payload)
         super().accept()
 
 
@@ -4128,6 +4650,10 @@ class MainWindow(QMainWindow):
             employees_button = QPushButton("Employee directory")
             employees_button.clicked.connect(self.open_employee_directory)
             top_actions.addWidget(employees_button)
+            if self.user["role"] in {"IT", "GM"}:
+                wages_button = QPushButton("Edit wages")
+                wages_button.clicked.connect(self.open_wage_manager)
+                top_actions.addWidget(wages_button)
             top_actions.addStretch()
             layout.addLayout(top_actions)
 
@@ -4322,6 +4848,11 @@ class MainWindow(QMainWindow):
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
 
+    def open_wage_manager(self) -> None:
+        dialog = WageManagerDialog()
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        dialog.exec()
+
     def open_change_password(self) -> None:
         dialog = ChangePasswordDialog(self.store, self.user["username"])
         dialog.setStyleSheet(THEME_STYLESHEET)
@@ -4329,15 +4860,27 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Password updated", "Your password has been changed successfully.")
 
     def open_policy_manager(self) -> None:
-        read_only = not (self.user_role in {"GM", "IT"})
-        if read_only and not (SHOW_POLICY_TO_SM and self.user_role == "SM"):
+        role = self.user_role
+        sm_allowed = SHOW_POLICY_TO_SM and role == "SM"
+        can_edit = role in {"GM", "IT"} or sm_allowed
+        if not can_edit:
             QMessageBox.information(
                 self,
                 "Access restricted",
                 "Access restricted to General Managers and IT Assistants.",
             )
             return
-        dialog = PolicyDialog(self.session_factory, self.user, read_only=read_only)
+        if role == "SM":
+            proceed = QMessageBox.question(
+                self,
+                "Heads up",
+                "Policy edits apply to the entire system and affect every store week. Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                return
+        dialog = PolicyDialog(self.session_factory, self.user, read_only=not can_edit)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
 

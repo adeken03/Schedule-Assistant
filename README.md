@@ -2,7 +2,7 @@
 
 Schedule Assistant is a Buffalo Wild Wings planning tool built with PySide6. It helps the GM/SM team project sales, manage modifiers, define scheduling policies, and generate a week of coverage without touching raw JSON.
 
-Latest feature work (2025-11-14): operating-hours inputs with open/close buffers, anchor-aware time blocks, and a cleaner swap/grant experience on the Week Schedule grid.
+Latest feature work (2025-11-18): warning-gated SM edits in Policy Manager, policy-driven labor budget percentages (global + per group), richer seed data, stochastic scheduling, and live budget gauges on Week Schedule.
 
 ## Team
 - Aaron Deken
@@ -11,9 +11,11 @@ Latest feature work (2025-11-14): operating-hours inputs with open/close buffers
 ## What it does
 - Role-aware login with session timeouts and audit logging.
 - Week Preparation pulls projections, modifiers, and policy presets into one place before building the schedule.
-- Week Schedule gives drag-friendly coverage editing plus swap/grant helpers.
+- Week Schedule gives drag-friendly coverage editing plus swap/grant helpers, plus live labor budget gauges to keep spending in check and highlight projected % of sales consumed by labor.
 - Validate / Import / Export moves week assets (employees, projections, modifiers, shifts) between files while tracking each transfer.
 - Policy Composer lets GMs adjust global guardrails, time blocks, and per-role coverage without editing JSON.
+- Policy settings UI captures per-day open/mid/close hours and clean role-group allocations, automatically driving AM/PM/Close blocks and labor budgets.
+- Role Wage Manager keeps hourly rates confirmed per role; the scheduler won't run until wages, projected sales, and active employees are all in place.
 - Account Manager and Employee Directory dialogs cover user onboarding and roster maintenance.
 
 ## Tech stack
@@ -64,22 +66,26 @@ Change that password immediately from the Account Manager dialog once you are in
 - **Week Preparation** - pick the ISO week, enter projections, and layer modifiers/events.
 - **Week Schedule** - build a draft schedule, tweak coverage, and run swap/grant actions.
 - **Validate / Import / Export** - run coverage checks, move data between weeks, or export PDFs/CSVs.
-- **Policies** - GM/IT roles can edit the active policy; SMs get read-only access when the flag is enabled.
+- **Policies** - GM/IT roles can edit the active policy, and SMs can edit after acknowledging a system-wide warning. Global labor % defaults to a realistic 27% of projected sales, with per-role group allocations layered on top.
 - **Employee Directory / Account Manager** - maintain roster data and application accounts.
 
 ## Policy + automation
 The Policy Composer exposes:
 - Global guardrails (min rest, max hours, split shift toggle, overtime penalty).
+- A global labor budget % (default 27% of projected sales) with a tolerance band managers can tighten or loosen.
 - Anchor-aware time blocks that understand `@open` / `@close` plus buffer minutes.
+- Role-group labor allocations, cut buffers, and cross-coverage rules so backup roles can fill last-resort gaps.
+- Inline policy editor with import/export so IT/GM can adjust guardrails without touching raw JSON.
+- Sequential workflow checks (wages, employees, projections) before generation so drafts stay grounded in real budgets.
 
-The generator consumes active policy, projections, modifiers, and availability to build a week plan. High-priority roles fill first, and every assignment honors rest windows plus desired-hour ranges.
+The generator consumes active policy, projections, modifiers, and availability to build a week plan. It honors rest windows, desired-hour ranges, labor budgets, and role group distributions while falling back to configured cross-coverage roles when no dedicated staff remain. Each run randomizes within the constraints to surface multiple valid drafts.
 
 ## Sample data
 Populate a starter roster and realistic availability:
 ```
 python -m app.scripts.seed_employees
 ```
-Run it once on a fresh database to get 30+ FOH/BOH records for demos and tests.
+Run it once on a fresh database to get 65+ FOH/BOH records for demos and tests, with balanced coverage for Prep/Chip/Shake and Cashier/To-Go.
 
 ## Development notes & troubleshooting
 - Data lives in `app/data/`. Delete `schedule.db` if you need a fresh environment (dev only).

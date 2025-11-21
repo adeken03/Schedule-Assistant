@@ -116,7 +116,18 @@ def close_minutes(policy: Dict, date_: datetime.date) -> int:
     return parsed if parsed is not None else 24 * 60
 
 
-ANCHOR_PATTERN = re.compile(r"^@(?P<anchor>open|close)(?P<offset>[+-]\d+)?$", re.IGNORECASE)
+def mid_minutes(policy: Dict, date_: datetime.date) -> int:
+    entry = _hours_entry(policy, date_)
+    label = entry.get("mid") if entry else None
+    parsed = parse_time_label(label)
+    if parsed is not None:
+        return parsed
+    open_value = open_minutes(policy, date_)
+    close_value = close_minutes(policy, date_)
+    return open_value + (close_value - open_value) // 2
+
+
+ANCHOR_PATTERN = re.compile(r"^@(?P<anchor>open|close|mid)(?P<offset>[+-]\d+)?$", re.IGNORECASE)
 
 
 def _parse_time_expression(
@@ -138,6 +149,8 @@ def _parse_time_expression(
         offset = int(offset_raw) if offset_raw else 0
         if anchor == "open":
             base = open_minutes(policy, date_)
+        elif anchor == "mid":
+            base = mid_minutes(policy, date_)
         else:
             base = close_min
         return base + offset
@@ -178,11 +191,16 @@ def resolve_policy_block(
     date_: datetime.date,
     *,
     close_min: Optional[int] = None,
+    overrides: Optional[Dict[str, str]] = None,
 ) -> Optional[Tuple[str, datetime.datetime, datetime.datetime]]:
     timeblocks = policy.get("timeblocks") or {}
     block_spec = timeblocks.get(block_name)
     if not isinstance(block_spec, dict):
         return None
+    if overrides:
+        merged = block_spec.copy()
+        merged.update({key: value for key, value in overrides.items() if value})
+        block_spec = merged
     close_value = close_min if close_min is not None else close_minutes(policy, date_)
     window = _resolve_block_window(policy, date_, block_spec, close_min=close_value)
     if not window:
@@ -228,18 +246,25 @@ def _block_config(
     max_staff: int | None = None,
     per_sales: float = 0.0,
     per_modifier: float = 0.0,
-) -> Dict[str, float | int]:
-    minimum = 0 if min_staff is None else min_staff
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+) -> Dict[str, float | int | str]:
+    minimum = base if min_staff is None else min_staff
     maximum = max(base, minimum) if max_staff is None else max_staff
     normalized_per_sales = max(0.0, min(per_sales, 0.05))
     normalized_per_modifier = max(0.0, min(per_modifier, 0.5))
-    return {
+    payload: Dict[str, float | int | str] = {
         "base": max(0, base),
         "min": max(0, minimum),
         "max": max(0, maximum),
         "per_1000_sales": normalized_per_sales,
         "per_modifier": normalized_per_modifier,
     }
+    if start:
+        payload["start"] = start
+    if end:
+        payload["end"] = end
+    return payload
 
 
 def _role_config(
@@ -251,6 +276,11 @@ def _role_config(
     daily_boost: Dict[str, int] | None = None,
     enabled: bool = True,
     thresholds: List[Dict[str, float | int | str]] | None = None,
+    group: str = "Other",
+    allow_cuts: bool = True,
+    always_on: bool = False,
+    cut_buffer_minutes: int = 30,
+    covers: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     return {
         "enabled": enabled,
@@ -261,24 +291,29 @@ def _role_config(
         "shift_length_rule": {"minHrs": 5, "maxHrs": 8, "preferBlocks": True},
         "thresholds": thresholds or [],
         "blocks": blocks,
+        "group": group,
+        "allow_cuts": allow_cuts,
+        "always_on": always_on,
+        "cut_buffer_minutes": cut_buffer_minutes,
+        "covers": covers or [],
     }
 
 
 DEFAULT_TIMEBLOCKS: Dict[str, Dict[str, str]] = {
     "Open": {"start": "@open-30", "end": "@open"},
-    "Mid": {"start": "@open", "end": "16:00"},
-    "PM": {"start": "16:00", "end": "@close"},
+    "Mid": {"start": "@open", "end": "@mid"},
+    "PM": {"start": "@mid", "end": "@close"},
     "Close": {"start": "@close", "end": "@close+35"},
 }
 
 BUSINESS_HOURS: Dict[str, Dict[str, str]] = {
-    "Mon": {"open": "11:00", "close": "24:00"},
-    "Tue": {"open": "11:00", "close": "24:00"},
-    "Wed": {"open": "11:00", "close": "24:00"},
-    "Thu": {"open": "11:00", "close": "24:00"},
-    "Fri": {"open": "11:00", "close": "25:00"},
-    "Sat": {"open": "11:00", "close": "25:00"},
-    "Sun": {"open": "11:00", "close": "23:00"},
+    "Mon": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+    "Tue": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+    "Wed": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+    "Thu": {"open": "11:00", "mid": "16:00", "close": "24:00"},
+    "Fri": {"open": "11:00", "mid": "16:00", "close": "25:00"},
+    "Sat": {"open": "11:00", "mid": "16:00", "close": "25:00"},
+    "Sun": {"open": "11:00", "mid": "16:00", "close": "23:00"},
 }
 
 
@@ -298,6 +333,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(3, max_staff=4, per_sales=0.3, per_modifier=0.5),
             "Close": _block_config(1, max_staff=3, per_sales=0.15, per_modifier=0.3),
         },
+        group="Servers",
+        cut_buffer_minutes=35,
+        covers=["Server - Cocktail", "Server - Patio"],
     ),
     "Server - Cocktail": _role_config(
         wage=6.75,
@@ -314,6 +352,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(2, max_staff=3, per_sales=0.2, per_modifier=0.4),
             "Close": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
         },
+        group="Servers",
+        cut_buffer_minutes=35,
+        covers=["Server - Dining", "Server - Patio"],
     ),
     "Server - Patio": _role_config(
         wage=6.0,
@@ -325,6 +366,31 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Mid": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
             "PM": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
         },
+        group="Servers",
+        cut_buffer_minutes=30,
+        covers=["Server - Dining", "Server - Cocktail"],
+    ),
+    "Server - Dining Closer": _role_config(
+        wage=6.75,
+        priority=1.05,
+        max_weekly=35,
+        daily_boost={"Thu": 1, "Fri": 1, "Sat": 1},
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        group="Servers",
+        allow_cuts=False,
+        cut_buffer_minutes=5,
+        covers=["Server - Dining"],
+    ),
+    "Server - Cocktail Closer": _role_config(
+        wage=7.0,
+        priority=1.0,
+        max_weekly=35,
+        daily_boost={"Thu": 1, "Fri": 1, "Sat": 1},
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        group="Servers",
+        allow_cuts=False,
+        cut_buffer_minutes=5,
+        covers=["Server - Cocktail"],
     ),
     "Bartender": _role_config(
         wage=10.0,
@@ -338,6 +404,21 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.3),
             "Close": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
         },
+        group="Bartenders",
+        allow_cuts=False,
+        always_on=True,
+        cut_buffer_minutes=0,
+    ),
+    "Bartender - Closer": _role_config(
+        wage=11.0,
+        priority=1.05,
+        max_weekly=40,
+        blocks={"Close": _block_config(1, min_staff=1, max_staff=1)},
+        group="Bartenders",
+        allow_cuts=False,
+        always_on=True,
+        cut_buffer_minutes=0,
+        covers=["Bartender"],
     ),
     "Cashier": _role_config(
         wage=15.0,
@@ -350,6 +431,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Mid": _block_config(1, max_staff=2, per_sales=0.1),
             "PM": _block_config(1, max_staff=2, per_sales=0.15),
         },
+        group="Cashier",
+        cut_buffer_minutes=20,
+        covers=["Cashier - To-Go Specialist", "Host"],
     ),
     "Cashier - To-Go Specialist": _role_config(
         wage=15.0,
@@ -362,6 +446,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(1, max_staff=2, per_sales=0.15, per_modifier=0.25),
             "Close": _block_config(1, max_staff=2, per_sales=0.1, per_modifier=0.2),
         },
+        group="Cashier",
+        cut_buffer_minutes=25,
+        covers=["Cashier", "Host"],
     ),
     "Host": _role_config(
         wage=14.0,
@@ -373,6 +460,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Open": _block_config(1, max_staff=1),
             "Mid": _block_config(1, max_staff=1),
         },
+        group="Cashier",
+        cut_buffer_minutes=25,
+        covers=["Cashier", "Cashier - To-Go Specialist"],
     ),
     "Expo": _role_config(
         wage=17.5,
@@ -386,6 +476,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(1, max_staff=2, per_sales=0.1),
             "Close": _block_config(1, max_staff=2),
         },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["Prep", "Chip", "Shake"],
     ),
     "Grill": _role_config(
         wage=18.0,
@@ -399,6 +492,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(1, max_staff=2, per_sales=0.15),
             "Close": _block_config(1, max_staff=2),
         },
+        group="Kitchen",
+        cut_buffer_minutes=30,
+        covers=["Cook", "Prep"],
     ),
     "Cook": _role_config(
         wage=17.0,
@@ -412,6 +508,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "PM": _block_config(1, max_staff=2, per_sales=0.15),
             "Close": _block_config(1, max_staff=2),
         },
+        group="Kitchen",
+        cut_buffer_minutes=30,
+        covers=["Prep", "Chip"],
     ),
     "Prep": _role_config(
         wage=16.0,
@@ -423,6 +522,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Open": _block_config(1, max_staff=1),
             "Mid": _block_config(1, max_staff=2),
         },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["Chip", "Shake"],
     ),
     "Chip": _role_config(
         wage=15.5,
@@ -434,6 +536,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Mid": _block_config(1, max_staff=2),
             "PM": _block_config(1, max_staff=2, per_sales=0.1),
         },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["Prep", "Shake"],
     ),
     "Shake": _role_config(
         wage=15.5,
@@ -445,6 +550,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
             "Mid": _block_config(1, max_staff=2),
             "PM": _block_config(1, max_staff=2, per_sales=0.1),
         },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["Prep", "Chip"],
     ),
     "Kitchen Opener": _role_config(
         wage=18.5,
@@ -452,6 +560,9 @@ ROLES: Dict[str, Dict[str, Any]] = {
         max_weekly=38,
         daily_boost={"Sun": -2},
         blocks={"Open": _block_config(1, max_staff=2)},
+        group="Kitchen",
+        cut_buffer_minutes=20,
+        covers=["Prep", "Chip", "Shake"],
     ),
     "Kitchen Closer": _role_config(
         wage=19.0,
@@ -459,7 +570,19 @@ ROLES: Dict[str, Dict[str, Any]] = {
         max_weekly=38,
         daily_boost={"Sun": -2},
         blocks={"Close": _block_config(1, max_staff=2)},
+        group="Kitchen",
+        allow_cuts=False,
+        cut_buffer_minutes=0,
+        covers=["Prep", "Chip", "Shake"],
     ),
+}
+
+
+ROLE_GROUP_ALLOCATIONS: Dict[str, Dict[str, Any]] = {
+    "Kitchen": {"allocation_pct": 0.34, "allow_cuts": True, "cut_buffer_minutes": 25},
+    "Servers": {"allocation_pct": 0.4, "allow_cuts": True, "cut_buffer_minutes": 35},
+    "Bartenders": {"allocation_pct": 0.12, "allow_cuts": False, "always_on": True, "cut_buffer_minutes": 0},
+    "Cashier": {"allocation_pct": 0.14, "allow_cuts": True, "cut_buffer_minutes": 25},
 }
 
 
@@ -468,7 +591,6 @@ BASELINE_POLICY: Dict[str, Any] = {
     "description": "Seeded policy that balances FOH/BOH coverage for the automation workflow.",
     "global": {
         "max_hours_week": 48,
-        "min_rest_hours": 10,
         "max_consecutive_days": 7,
         "round_to_minutes": 15,
         "allow_split_shifts": True,
@@ -477,9 +599,12 @@ BASELINE_POLICY: Dict[str, Any] = {
         "desired_hours_ceiling_pct": 1.15,
         "open_buffer_minutes": 30,
         "close_buffer_minutes": 35,
+        "labor_budget_pct": 0.27,
+        "labor_budget_tolerance_pct": 0.08,
     },
     "timeblocks": DEFAULT_TIMEBLOCKS,
     "business_hours": BUSINESS_HOURS,
+    "role_groups": ROLE_GROUP_ALLOCATIONS,
     "roles": ROLES,
 }
 

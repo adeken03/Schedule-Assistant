@@ -23,6 +23,7 @@ from database import (
 )
 from exporter import DATA_DIR as EXPORT_DIR
 from roles import defined_roles
+from wages import export_wages, import_wages
 
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
 VALID_ROLES = set(defined_roles())
@@ -276,6 +277,19 @@ def import_week_schedule(session, week_start: datetime.date, file_path: Path) ->
         added += 1
     set_week_status(session, week_start, "draft")
     return added
+
+
+# ---------------------------------------------------------------------------
+# Role wage import/export
+
+
+def export_role_wages_dataset() -> Path:
+    filename = EXPORT_DIR / f"role_wages_{_timestamp()}.json"
+    return export_wages(filename)
+
+
+def import_role_wages_dataset(file_path: Path) -> int:
+    return import_wages(file_path)
 
 
 # ---------------------------------------------------------------------------

@@ -510,10 +510,23 @@ def get_active_policy(session) -> Optional[Policy]:
     return session.scalars(stmt).first()
 
 
+OVERNIGHT_CLOSE_CUTOFF_HOUR = 6
+
+
 def _ensure_aware(value: datetime.datetime) -> datetime.datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=datetime.timezone.utc)
     return value.astimezone(datetime.timezone.utc)
+
+
+def shift_display_date(start: datetime.datetime, location: Optional[str]) -> datetime.date:
+    """Return the canonical day a shift should belong to for reporting."""
+
+    aware_start = _ensure_aware(start)
+    day = aware_start.date()
+    if (location or "").strip().lower() == "close" and aware_start.hour < OVERNIGHT_CLOSE_CUTOFF_HOUR:
+        return day - datetime.timedelta(days=1)
+    return day
 
 
 def _shift_to_dict(shift: Shift, employee: Optional[Employee]) -> Dict[str, Any]:
@@ -650,6 +663,11 @@ def get_shifts_for_week(
 def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
     normalized = _normalize_week_start(week_start_date)
     week = get_or_create_week(session, normalized)
+    if not week.context_id:
+        context = get_or_create_week_context(session, week.iso_year, week.iso_week, week.label)
+        week.context_id = context.id
+        session.commit()
+    context_id = week.context_id
     start_of_day = normalized
     totals = {}
     total_cost = 0.0
@@ -660,7 +678,7 @@ def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
     for shift in session.scalars(select(Shift).where(Shift.week_id == week.id)):
         if is_manager_role(shift.role):
             continue
-        shift_day = shift.start.astimezone(datetime.timezone.utc).date()
+        shift_day = shift_display_date(shift.start, shift.location)
         info = totals.get(shift_day)
         if info is None:
             continue
@@ -668,6 +686,11 @@ def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
         info["cost"] += float(shift.labor_cost or 0.0)
         total_cost += float(shift.labor_cost or 0.0)
         total_shifts += 1
+    projections = get_week_daily_projections(session, context_id)
+    projected_sales_total = sum(float(projection.projected_sales_amount or 0.0) for projection in projections)
+    if projected_sales_total <= 0:
+        # Fallback to actual labor spend if projections are missing so the UI can at least show current percentages.
+        projected_sales_total = total_cost
     days_payload = [
         {
             "date": day.isoformat(),
@@ -682,6 +705,7 @@ def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
         "days": days_payload,
         "total_cost": round(total_cost, 2),
         "total_shifts": total_shifts,
+        "projected_sales_total": round(projected_sales_total, 2),
     }
 
 

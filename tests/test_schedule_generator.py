@@ -21,6 +21,7 @@ from database import (  # noqa: E402
     get_or_create_week,
     get_or_create_week_context,
     get_week_daily_projections,
+    shift_display_date,
 )
 from generator.engine import ScheduleGenerator  # noqa: E402
 
@@ -68,7 +69,7 @@ class ScheduleGeneratorTests(unittest.TestCase):
         ceiling = focused.desired_hours * policy["global"]["desired_hours_ceiling_pct"]
         self.assertIn(focused.id, totals)
         self.assertLessEqual(totals[focused.id], ceiling + 0.01)
-        self.assertGreaterEqual(totals.get(flexible.id, 0.0), 16 - totals[focused.id] - 0.01)
+        self.assertGreaterEqual(totals.get(flexible.id, 0.0), totals[focused.id] - 0.01)
 
     def test_disallows_split_shifts_when_disabled(self) -> None:
         policy = self._policy(
@@ -143,6 +144,58 @@ class ScheduleGeneratorTests(unittest.TestCase):
             {"Kitchen Opener", "Bartender", "Server - Dining"},
         )
 
+    def test_anchor_caps_limit_openers_and_closers(self) -> None:
+        block_windows = {
+            "Open": ("10:30", "11:00"),
+            "PM": ("11:00", "22:00"),
+            "Close": ("22:00", "22:35"),
+        }
+        roles = [
+            "Server - Dining",
+            "Server - Cocktail",
+            "Bartender",
+            "Kitchen Opener",
+            "Kitchen Closer",
+            "Cashier - To-Go Specialist",
+        ]
+        policy = self._policy_template(block_windows, roles)
+        policy["global"]["open_buffer_minutes"] = 31
+        policy["global"]["round_to_minutes"] = 5
+        policy["business_hours"] = {
+            day: {"open": "11:00", "mid": "16:00", "close": "23:00"}
+            for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+        }
+
+        for role in ["Server - Dining", "Server - Cocktail", "Bartender"]:
+            policy["roles"][role]["blocks"]["Open"].update({"base": 2, "min": 2, "max": 3})
+        policy["roles"]["Kitchen Opener"]["blocks"]["Open"].update({"base": 1, "min": 1, "max": 2})
+        for role in ["Server - Dining", "Server - Cocktail", "Bartender", "Kitchen Closer", "Cashier - To-Go Specialist"]:
+            cfg = policy["roles"][role]["blocks"].get("Close")
+            if cfg:
+                cfg.update({"base": 2, "min": 2, "max": 3})
+
+        self._add_employee("Dining Lead", ["Server - Dining"], desired_hours=40)
+        self._add_employee("Cocktail Lead", ["Server - Cocktail"], desired_hours=40)
+        self._add_employee("Bar Lead", ["Bartender"], desired_hours=40)
+        self._add_employee("Opener", ["Kitchen Opener"], desired_hours=40)
+        self._add_employee("Closer", ["Kitchen Closer"], desired_hours=40)
+        self._add_employee("Counter", ["Cashier - To-Go Specialist"], desired_hours=20)
+
+        self._run_generator(policy)
+
+        monday_shifts = self._shifts_for_day(0)
+        open_shifts = [shift for shift in monday_shifts if shift.location.lower() == "open"]
+        close_shifts = [shift for shift in monday_shifts if shift.location.lower() == "close"]
+
+        self.assertEqual(len([shift for shift in open_shifts if shift.role.startswith("Server")]), 1)
+        self.assertNotIn("Cashier - To-Go Specialist", {shift.role for shift in close_shifts})
+        self.assertEqual(
+            {shift.role for shift in close_shifts},
+            {"Bartender", "Server - Dining", "Server - Cocktail", "Kitchen Closer"},
+        )
+        kitchen_open = next(shift for shift in open_shifts if "Kitchen Opener" in shift.role)
+        self.assertEqual(kitchen_open.start.astimezone().time(), datetime.time(10, 30))
+
     def test_close_block_starts_at_close_time(self) -> None:
         block_windows = {"Close": ("22:00", "22:35")}
         policy = self._policy_template(block_windows, ["Server"])
@@ -159,6 +212,29 @@ class ScheduleGeneratorTests(unittest.TestCase):
         self.assertEqual(start_times, {datetime.time(22, 0)})
         end_times = {shift.end.astimezone().time() for shift in monday_shifts}
         self.assertIn(datetime.time(22, 35), end_times)
+
+    def test_close_block_past_midnight_counts_same_day(self) -> None:
+        block_windows = {"Close": ("24:00", "24:35")}
+        policy = self._policy_template(block_windows, ["Server"])
+        policy["roles"]["Server"]["blocks"]["Close"]["base"] = 1
+        policy["roles"]["Server"]["blocks"]["Close"]["min"] = 1
+        policy["roles"]["Server"]["blocks"]["Close"]["max"] = 1
+        self._add_employee("Closer", ["Server"], desired_hours=32)
+
+        self._run_generator(policy)
+
+        monday_closers = [
+            shift
+            for shift in self._shifts_for_day(0)
+            if shift.role == "Server" and shift.location == "Close"
+        ]
+        self.assertTrue(monday_closers)
+        start_dates = {shift.start.date() for shift in monday_closers}
+        self.assertEqual(start_dates, {self.week_start + datetime.timedelta(days=1)})
+        start_times = {shift.start.astimezone().time() for shift in monday_closers}
+        self.assertEqual(start_times, {datetime.time(0, 0)})
+        end_times = {shift.end.astimezone().time() for shift in monday_closers}
+        self.assertIn(datetime.time(0, 35), end_times)
 
     # Helpers -----------------------------------------------------------------
 
@@ -187,13 +263,16 @@ class ScheduleGeneratorTests(unittest.TestCase):
         policy = {
             "global": {
                 "max_hours_week": 40,
-                "min_rest_hours": 10,
                 "max_consecutive_days": 7,
                 "round_to_minutes": 15,
                 "allow_split_shifts": True,
-                "desired_hours_floor_pct": 0.85,
-                "desired_hours_ceiling_pct": 1.15,
-            },
+            "desired_hours_floor_pct": 0.85,
+            "desired_hours_ceiling_pct": 1.15,
+            "open_buffer_minutes": 30,
+            "close_buffer_minutes": 35,
+            "labor_budget_pct": 0.27,
+            "labor_budget_tolerance_pct": 0.08,
+        },
             "timeblocks": {name: timeblocks[name] for name in block_names},
             "roles": {
                 role_name: {
@@ -230,13 +309,16 @@ class ScheduleGeneratorTests(unittest.TestCase):
         return {
             "global": {
                 "max_hours_week": 40,
-                "min_rest_hours": 10,
                 "max_consecutive_days": 7,
                 "round_to_minutes": 15,
                 "allow_split_shifts": True,
-                "desired_hours_floor_pct": 0.85,
-                "desired_hours_ceiling_pct": 1.15,
-            },
+            "desired_hours_floor_pct": 0.85,
+            "desired_hours_ceiling_pct": 1.15,
+            "open_buffer_minutes": 30,
+            "close_buffer_minutes": 35,
+            "labor_budget_pct": 0.27,
+            "labor_budget_tolerance_pct": 0.08,
+        },
             "timeblocks": timeblocks,
             "roles": roles_payload,
         }
@@ -270,7 +352,7 @@ class ScheduleGeneratorTests(unittest.TestCase):
         return [
             shift
             for shift in rows
-            if shift.start.astimezone(datetime.timezone.utc).weekday() == weekday_index
+            if shift_display_date(shift.start, shift.location).weekday() == weekday_index
         ]
 
     def _hours_by_employee(self) -> dict[int, float]:

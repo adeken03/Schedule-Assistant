@@ -39,3 +39,29 @@ Version beta-00012
 
 Version beta-00013
 - Final cleanup before the repo push; everything is stable except the policy and schedule generator modules we will fix later.
+
+Version beta-00014
+- SMs now get a system-wide warning before editing policy, every workflow action audits, and the Policy Composer picked up cross-coverage + group budget controls.
+- Generator prioritizes required coverage before extras, honors the revised guardrails, and UI shifts now show “cut around” notes plus live budget gauges.
+- Seed data grew past 60 employees to cover Host/Chip/Shake gaps, and the Week Schedule footer reports projected % of labor budget and projected sales consumed.
+
+Version beta-00015
+- Labor budgets now start with a global “% of projected sales” dial, and each role group claims its share—persisting across weeks and restarts.
+- Policy Composer stayed manager-friendly but now exposes the global labor % and per-group percentages in one place; SM/GM/IT edits remain warning-gated and fully audited.
+- Generator respects the new budget knobs, falls back across roles more intelligently, and each run introduces slight variability so multiple compliant drafts surface for review.
+
+Version beta-00016
+- Added a Role Wages manager (import/export/reset) with confirmation indicators, plus hard pre-flight checks so generation won't run until wages, employees, and projected sales are complete.
+- Policy Composer now includes labor-budget tolerance sliders, and the generator enforces those budgets per role group while honoring the new wage overrides.
+- Validate / Import / Export gained a wages dataset, Sunday coverage balances out with the expanded seed roster, and Week Schedule footer percentages line up with the enforced labor math.
+
+Version beta-00017
+- Policy view is now a full GUI editor: edit/save global guardrails, labor percentages (with tolerance), time blocks, and role-group allocations inline, plus import/export JSON without touching raw data.
+- Removed fallback sales and min-rest fields, making projections mandatory; budget gauges now reflect real sales and the generator enforces only max hours/consecutive-day limits.
+- Defined dedicated closer roles (server dining/cocktail, bartender, kitchen) so only four closers are scheduled per night with the correct close-window rules.
+
+Version beta-00018
+- Policy settings expose per-day open/mid/close hours, simplified AM/PM windows, and lean role-group percentage inputs that feed directly into the scheduler.
+- Generator now understands the `@mid` anchor plus the new hours data, so AM/PM/Close coverage honors store hours without editing raw JSON.
+- Week Schedule footer always shows budget percentages (even before projections), and policy exports/imports remain single-click for managers.
+
