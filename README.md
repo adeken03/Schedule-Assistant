@@ -95,3 +95,4 @@ Run it once on a fresh database to get 65+ FOH/BOH records for demos and tests, 
   python app/scripts/workflow_smoke.py --week-start YYYY-MM-DD   # week arg optional
   ```
 - If UI assets fail to load, confirm the app is running inside the repo root so paths resolve correctly.
+

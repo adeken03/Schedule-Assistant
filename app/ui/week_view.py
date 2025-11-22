@@ -34,19 +34,20 @@ from database import (
     get_week_daily_projections,
     get_week_summary,
     list_employees,
+    list_modifiers_for_week,
     list_roles,
     record_audit_log,
     shift_display_date,
     upsert_shift,
 )
 from generator.api import generate_schedule_for_week
-from policy import load_active_policy, role_catalog
+from policy import build_default_policy, load_active_policy, role_catalog
 from wages import validate_wages
 from roles import grouped_roles, is_manager_role, palette_for_role, role_group, role_matches
 from ui.edit_shift import EditShiftDialog
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-ROLE_GROUP_ORDER = ["Heart of House", "Servers", "Bartenders", "Cashier & Takeout", "Other"]
+ROLE_GROUP_ORDER = ["Kitchen", "Servers", "Bartenders", "Cashier", "Other"]
 
 
 class WeekSchedulePage(QWidget):
@@ -98,16 +99,22 @@ class WeekSchedulePage(QWidget):
         header = QHBoxLayout()
         header.setSpacing(8)
 
-        self.prev_week_button = QPushButton("<")
+        self.prev_week_button = QPushButton("◀")
+        self.prev_week_button.setFixedSize(30, 30)
+        self.prev_week_button.setStyleSheet("border-radius: 15px; padding: 0;")
         self.prev_week_button.clicked.connect(lambda: self._navigate_week(-7))
         header.addWidget(self.prev_week_button)
 
         self.week_picker = QDateEdit()
         self.week_picker.setCalendarPopup(True)
+        self.week_picker.setDisplayFormat("yyyy-MM-dd")
+        self.week_picker.setMinimumWidth(120)
         self.week_picker.dateChanged.connect(self._handle_week_picker_change)
         header.addWidget(self.week_picker)
 
-        self.next_week_button = QPushButton(">")
+        self.next_week_button = QPushButton("▶")
+        self.next_week_button.setFixedSize(30, 30)
+        self.next_week_button.setStyleSheet("border-radius: 15px; padding: 0;")
         self.next_week_button.clicked.connect(lambda: self._navigate_week(7))
         header.addWidget(self.next_week_button)
 
@@ -282,8 +289,9 @@ class WeekSchedulePage(QWidget):
             iso_year, iso_week, _ = self.week_start.isocalendar()
             context = get_or_create_week_context(session, iso_year, iso_week, f"{iso_year} W{iso_week:02d}")
             projections = get_week_daily_projections(session, context.id)
+            modifiers = list_modifiers_for_week(session, self.week_start)
         self.current_shifts = [shift for shift in shifts if not is_manager_role(shift.get("role"))]
-        self.group_breakdown = self._build_group_breakdown(shifts, projections)
+        self.group_breakdown = self._build_group_breakdown(shifts, projections, modifiers)
         self._sync_selected_ids()
         if selected_group:
             allowed_roles = set(self._roles_by_group.get(selected_group, []))
@@ -433,7 +441,7 @@ class WeekSchedulePage(QWidget):
             f"- Projected {policy_usage} of Policy Labor Budget - Projected {sales_usage} of Projected Sales"
         )
         breakdown_parts: List[str] = []
-        display_order = ["Heart of House", "Servers", "Bartenders", "Cashier & Takeout"]
+        display_order = ["Kitchen", "Servers", "Bartenders", "Cashier"]
         for group in display_order:
             payload = self.group_breakdown.get(group, {})
             budget = payload.get("budget", 0.0)
@@ -828,9 +836,9 @@ class WeekSchedulePage(QWidget):
     @staticmethod
     def _display_group_name(group: str) -> str:
         if group in {"Kitchen", "Heart of House"}:
-            return "Heart of House"
+            return "Kitchen"
         if group in {"Cashier & Takeout", "Cashier"}:
-            return "Cashier & Takeout"
+            return "Cashier"
         return group or "Other"
 
     def _role_group_from_policy(self, role: Optional[str]) -> str:
@@ -843,13 +851,45 @@ class WeekSchedulePage(QWidget):
                 return str(explicit)
         return role_group(role)
 
-    def _build_group_breakdown(self, shifts: List[Dict], projections) -> Dict[str, Dict[str, float]]:
+    def _build_group_breakdown(self, shifts: List[Dict], projections, modifiers) -> Dict[str, Dict[str, float]]:
         budgets: Dict[str, float] = {}
         labor_pct = self._policy_labor_pct()
         role_groups_cfg = self.policy.get("role_groups", {}) if isinstance(self.policy, dict) else {}
+        if not isinstance(role_groups_cfg, dict) or not role_groups_cfg:
+            role_groups_cfg = build_default_policy().get("role_groups", {})
+
+        modifier_map: Dict[int, List[Dict[str, float]]] = {idx: [] for idx in range(7)}
+        for mod in modifiers or []:
+            day_idx = int(mod.get("day_of_week", 0))
+            start = mod.get("start_time")
+            end = mod.get("end_time")
+            pct = float(mod.get("pct_change", 0) or 0)
+            start_minutes = start.hour * 60 + start.minute if start else 0
+            end_minutes = end.hour * 60 + end.minute if end else 24 * 60
+            modifier_map.setdefault(day_idx, []).append(
+                {
+                    "start": start_minutes,
+                    "end": end_minutes,
+                    "pct": pct,
+                }
+            )
+
+        def _modifier_multiplier(day_index: int) -> float:
+            windows = modifier_map.get(day_index, [])
+            if not windows:
+                return 1.0
+            total = 0.0
+            for window in windows:
+                span = max(0.0, window["end"] - window["start"])
+                fraction = span / (24 * 60)
+                total += (window["pct"] / 100.0) * max(fraction, 0.1)
+            return max(0.5, 1.0 + total)
+
         for projection in projections or []:
             sales = float(getattr(projection, "projected_sales_amount", 0.0) or 0.0)
-            day_budget = sales * labor_pct
+            day_idx = int(getattr(projection, "day_of_week", 0) or 0)
+            adjusted_sales = sales * _modifier_multiplier(day_idx)
+            day_budget = adjusted_sales * labor_pct
             for group_name, spec in role_groups_cfg.items():
                 pct = spec.get("allocation_pct", 0.0)
                 try:

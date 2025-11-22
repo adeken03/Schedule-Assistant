@@ -686,8 +686,44 @@ def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
         info["cost"] += float(shift.labor_cost or 0.0)
         total_cost += float(shift.labor_cost or 0.0)
         total_shifts += 1
+
     projections = get_week_daily_projections(session, context_id)
-    projected_sales_total = sum(float(projection.projected_sales_amount or 0.0) for projection in projections)
+    modifiers = list_modifiers_for_week(session, normalized)
+
+    modifier_map: Dict[int, List[Dict[str, float]]] = {idx: [] for idx in range(7)}
+    for mod in modifiers or []:
+        day_idx = int(mod.get("day_of_week", 0))
+        start = mod.get("start_time")
+        end = mod.get("end_time")
+        pct = float(mod.get("pct_change", 0) or 0)
+        start_minutes = start.hour * 60 + start.minute if start else 0
+        end_minutes = end.hour * 60 + end.minute if end else 24 * 60
+        modifier_map.setdefault(day_idx, []).append(
+            {
+                "start": start_minutes,
+                "end": end_minutes,
+                "pct": pct,
+            }
+        )
+
+    def _modifier_multiplier(day_index: int) -> float:
+        windows = modifier_map.get(day_index, [])
+        if not windows:
+            return 1.0
+        total = 0.0
+        for window in windows:
+            span = max(0.0, window["end"] - window["start"])
+            fraction = span / (24 * 60)
+            total += (window["pct"] / 100.0) * max(fraction, 0.1)
+        return max(0.5, 1.0 + total)
+
+    projected_sales_raw = 0.0
+    projected_sales_total = 0.0
+    for projection in projections:
+        sales = float(projection.projected_sales_amount or 0.0)
+        projected_sales_raw += sales
+        day_idx = int(getattr(projection, "day_of_week", 0) or 0)
+        projected_sales_total += sales * _modifier_multiplier(day_idx)
     if projected_sales_total <= 0:
         # Fallback to actual labor spend if projections are missing so the UI can at least show current percentages.
         projected_sales_total = total_cost
@@ -706,6 +742,7 @@ def get_week_summary(session, week_start_date: datetime.date) -> Dict[str, Any]:
         "total_cost": round(total_cost, 2),
         "total_shifts": total_shifts,
         "projected_sales_total": round(projected_sales_total, 2),
+        "projected_sales_total_raw": round(projected_sales_raw, 2),
     }
 
 

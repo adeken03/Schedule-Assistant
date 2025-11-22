@@ -1025,6 +1025,7 @@ class WeekSelectorWidget(QWidget):
         self.on_change = on_change
         self.active_week = active_week
         self._updating = False
+        self.week_start = week_start_date(active_week["iso_year"], active_week["iso_week"])
         self._build_ui()
         self.set_active_week(active_week)
 
@@ -1033,69 +1034,64 @@ class WeekSelectorWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        layout.addWidget(QLabel("Active week"))
+        self.prev_button = QPushButton("◀")
+        self.prev_button.setFixedSize(30, 30)
+        self.prev_button.setStyleSheet("border-radius: 15px; padding: 0;")
+        self.prev_button.clicked.connect(lambda: self._navigate(-7))
+        layout.addWidget(self.prev_button)
 
-        self.week_combo = QComboBox()
-        self.week_combo.currentIndexChanged.connect(self._handle_combo_change)
-        layout.addWidget(self.week_combo)
+        self.week_picker = QDateEdit()
+        self.week_picker.setCalendarPopup(True)
+        self.week_picker.setDisplayFormat("yyyy-MM-dd")
+        self.week_picker.setMinimumWidth(120)
+        self.week_picker.dateChanged.connect(self._handle_date_change)
+        layout.addWidget(self.week_picker)
 
-        self.apply_button = QPushButton("Select week")
-        self.apply_button.clicked.connect(self._handle_apply_clicked)
-        layout.addWidget(self.apply_button)
+        self.next_button = QPushButton("▶")
+        self.next_button.setFixedSize(30, 30)
+        self.next_button.setStyleSheet("border-radius: 15px; padding: 0;")
+        self.next_button.clicked.connect(lambda: self._navigate(7))
+        layout.addWidget(self.next_button)
 
+        self.week_label = QLabel("Week of --")
+        layout.addWidget(self.week_label)
         layout.addStretch(1)
 
     def set_active_week(self, active_week: Dict[str, Any]) -> None:
         self.active_week = active_week
-        with self.session_factory() as session:
-            weeks = get_all_weeks(session)
-            if not weeks:
-                week = get_or_create_week_context(
-                    session,
-                    active_week["iso_year"],
-                    active_week["iso_week"],
-                    active_week["label"],
-                )
-                weeks = [week]
+        self.week_start = week_start_date(active_week["iso_year"], active_week["iso_week"])
         self._updating = True
-        self.week_combo.clear()
-        selected_index = 0
-        for idx, week in enumerate(weeks):
-            self.week_combo.addItem(week.label, (week.iso_year, week.iso_week))
-            if (
-                week.iso_year == active_week["iso_year"]
-                and week.iso_week == active_week["iso_week"]
-            ):
-                selected_index = idx
-        self.week_combo.setCurrentIndex(selected_index)
+        qdate = QDate(self.week_start.year, self.week_start.month, self.week_start.day)
+        self.week_picker.setDate(qdate)
+        self.week_label.setText(f"Week of {self.week_start.isoformat()}")
         self._updating = False
 
-    def _handle_combo_change(self) -> None:
-        if self._updating:
-            return
-        data = self.week_combo.currentData()
-        if not data:
-            return
-        iso_year, iso_week = data
-        label = self.week_combo.currentText()
-        self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
+    def _notify_change(self) -> None:
+        iso_year, iso_week, _ = self.week_start.isocalendar()
+        label = week_label(iso_year, iso_week)
         if self.on_change:
             self.on_change(iso_year, iso_week, label)
 
-    def _handle_apply_clicked(self) -> None:
-        start = week_start_date(self.active_week["iso_year"], self.active_week["iso_week"])
-        dialog = WeekPickerDialog(start, parent=self)
-        if dialog.exec() != QDialog.Accepted:
+    def _navigate(self, delta_days: int) -> None:
+        self.week_start = self.week_start + datetime.timedelta(days=delta_days)
+        monday = self.week_start - datetime.timedelta(days=self.week_start.weekday())
+        self.week_start = monday
+        self.set_active_week(
+            {"iso_year": self.week_start.isocalendar()[0], "iso_week": self.week_start.isocalendar()[1], "label": week_label(*self.week_start.isocalendar()[:2])}
+        )
+        self._notify_change()
+
+    def _handle_date_change(self) -> None:
+        if self._updating:
             return
-        selected_date = dialog.selected_date()
-        iso_year, iso_week, _ = selected_date.isocalendar()
-        label = week_label(iso_year, iso_week)
-        with self.session_factory() as session:
-            week = get_or_create_week_context(session, iso_year, iso_week, label)
-            label = week.label
-        self.set_active_week({"iso_year": iso_year, "iso_week": iso_week, "label": label})
-        if self.on_change:
-            self.on_change(iso_year, iso_week, label)
+        qdate = self.week_picker.date()
+        new_date = datetime.date(qdate.year(), qdate.month(), qdate.day())
+        monday = new_date - datetime.timedelta(days=new_date.weekday())
+        self.week_start = monday
+        self.set_active_week(
+            {"iso_year": monday.isocalendar()[0], "iso_week": monday.isocalendar()[1], "label": week_label(*monday.isocalendar()[:2])}
+        )
+        self._notify_change()
 
 
 class WeekPickerDialog(QDialog):
@@ -2587,6 +2583,7 @@ class PolicyComposerDialog(QDialog):
         timeblocks = _timeblocks_from_params(params)
         block_names = [row["name"] for row in timeblocks]
         default_role_groups = build_default_policy().get("role_groups", {})
+        default_anchors = build_default_policy().get("anchors", {})
         roles_payload: Dict[str, Any] = {}
         existing_roles = params.get("roles") if isinstance(params, dict) else {}
         if not isinstance(existing_roles, dict):
@@ -2652,6 +2649,7 @@ class PolicyComposerDialog(QDialog):
                 if isinstance(params.get("role_groups"), dict)
                 else default_role_groups
             ),
+            "anchors": params.get("anchors") if isinstance(params.get("anchors"), dict) else default_anchors,
         }
 
     def _build_global_tab(self) -> QWidget:
@@ -2688,6 +2686,19 @@ class PolicyComposerDialog(QDialog):
         if tolerance_pct <= 1:
             tolerance_pct *= 100
         self.labor_tolerance_spin.setValue(tolerance_pct)
+        anchors_cfg = self.policy_payload.get("anchors", {})
+        self.open_close_combo = QComboBox()
+        self.open_close_combo.addItem("Off (no preference)", "off")
+        self.open_close_combo.addItem("Prefer (recommended)", "prefer")
+        self.open_close_combo.addItem("Enforce (strict FIFO/LILO)", "enforce")
+        order_value = str(anchors_cfg.get("open_close_order", "prefer")).lower()
+        idx = self.open_close_combo.findData(order_value if order_value in {"off", "prefer", "enforce"} else "prefer")
+        if idx >= 0:
+            self.open_close_combo.setCurrentIndex(idx)
+        self.open_close_combo.setToolTip(
+            "Controls opener/closer ordering and staggered cuts: Off = ignore; "
+            "Prefer = keep first-in/first-out when possible; Enforce = strongly prioritize that order."
+        )
 
         intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
         intro.setWordWrap(True)
@@ -2698,6 +2709,7 @@ class PolicyComposerDialog(QDialog):
         guard_form.addRow("Max hours per week", self.max_hours_spin)
         guard_form.addRow("Max consecutive days", self.max_consec_spin)
         guard_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
+        guard_form.addRow("Opener/Closer order bias", self.open_close_combo)
         layout.addWidget(guardrails_box)
 
         hours_box = QGroupBox("Operating hours")
@@ -3230,6 +3242,9 @@ class PolicyComposerDialog(QDialog):
             }
         if role_groups_payload:
             self.policy_payload["role_groups"] = role_groups_payload
+        anchors_payload = self.policy_data.get("anchors", build_default_policy().get("anchors", {})).copy()
+        anchors_payload["open_close_order"] = self.open_close_combo.currentData()
+        self.policy_payload["anchors"] = anchors_payload
         params = {
             "description": self.policy_payload.get("description", ""),
             "global": self.policy_payload["global"],
@@ -3239,6 +3254,7 @@ class PolicyComposerDialog(QDialog):
             "business_hours": self.policy_payload["business_hours"],
             "roles": self.role_models,
             "role_groups": self.policy_payload.get("role_groups", {}),
+            "anchors": self.policy_payload.get("anchors", {}),
         }
         self.result_data = {"name": name, "params": params}
         super().accept()
@@ -3259,7 +3275,11 @@ class PolicyDialog(QDialog):
         self._load_policy()
 
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
+        outer = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
 
         name_form = QFormLayout()
         self.name_input = QLineEdit()
@@ -3290,6 +3310,14 @@ class PolicyDialog(QDialog):
         self.open_buffer_spin.setRange(0, 120)
         self.close_buffer_spin = QSpinBox()
         self.close_buffer_spin.setRange(0, 240)
+        self.open_close_combo = QComboBox()
+        self.open_close_combo.addItem("Off (no preference)", "off")
+        self.open_close_combo.addItem("Prefer (recommended)", "prefer")
+        self.open_close_combo.addItem("Enforce (strict FIFO/LILO)", "enforce")
+        self.open_close_combo.setToolTip(
+            "Controls opener/closer ordering and staggered cuts: Off = ignore; "
+            "Prefer = keep first-in/first-out when possible; Enforce = strongly prioritize that order."
+        )
         global_form.addRow("Max hours per week", self.max_hours_spin)
         global_form.addRow("Max consecutive days", self.max_consec_spin)
         global_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
@@ -3297,6 +3325,7 @@ class PolicyDialog(QDialog):
         global_form.addRow("Desired hours max%", self.desired_ceiling_spin)
         global_form.addRow("Open buffer (minutes)", self.open_buffer_spin)
         global_form.addRow("Close buffer (minutes)", self.close_buffer_spin)
+        global_form.addRow("Opener/Closer order bias", self.open_close_combo)
         layout.addWidget(global_box)
 
         labor_box = QGroupBox("Labor budget")
@@ -3373,6 +3402,24 @@ class PolicyDialog(QDialog):
         buttons.addWidget(close_button)
         layout.addLayout(buttons)
 
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        self._disable_scroll_wheel(
+            [
+                self.max_hours_spin,
+                self.max_consec_spin,
+                self.round_minutes_spin,
+                self.desired_floor_spin,
+                self.desired_ceiling_spin,
+                self.open_buffer_spin,
+                self.close_buffer_spin,
+                self.labor_budget_spin,
+                self.labor_tolerance_spin,
+                self.week_picker if hasattr(self, "week_picker") else None,
+            ]
+        )
+
         if self.read_only:
             for widget in [
                 self.name_input,
@@ -3384,6 +3431,7 @@ class PolicyDialog(QDialog):
                 self.desired_ceiling_spin,
                 self.open_buffer_spin,
                 self.close_buffer_spin,
+                self.open_close_combo,
                 self.labor_budget_spin,
                 self.labor_tolerance_spin,
                 self.hours_table,
@@ -3419,6 +3467,11 @@ class PolicyDialog(QDialog):
         self.desired_ceiling_spin.setValue(max(self.desired_floor_spin.value(), ceil))
         self.open_buffer_spin.setValue(int(global_cfg.get("open_buffer_minutes", 30)))
         self.close_buffer_spin.setValue(int(global_cfg.get("close_buffer_minutes", 35)))
+        anchors_cfg = self.policy_data.get("anchors", {})
+        order_value = str(anchors_cfg.get("open_close_order", "prefer")).lower()
+        idx = self.open_close_combo.findData(order_value if order_value in {"off", "prefer", "enforce"} else "prefer")
+        if idx >= 0:
+            self.open_close_combo.setCurrentIndex(idx)
         labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
         if labor_pct <= 1:
             labor_pct *= 100
@@ -3483,6 +3536,7 @@ class PolicyDialog(QDialog):
             allocation_spin.setRange(0.0, 100.0)
             allocation_spin.setSuffix("%")
             allocation_spin.setValue(pct)
+            PolicyComposerDialog._disable_scroll_wheel([allocation_spin])
             self.role_group_table.setItem(row, 0, QTableWidgetItem(group))
             self.role_group_table.item(row, 0).setFlags(Qt.ItemIsEnabled)
             self.role_group_table.setCellWidget(row, 1, allocation_spin)
@@ -3622,12 +3676,21 @@ class PolicyDialog(QDialog):
         defaults = build_default_policy()
         self.policy_data.setdefault("roles", defaults.get("roles", {}))
         self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
+        self.policy_data.setdefault("anchors", defaults.get("anchors", {}))
         hours = self.policy_data.setdefault("business_hours", defaults.get("business_hours", _default_business_hours()))
         defaults_hours = defaults.get("business_hours", _default_business_hours())
         for day in WEEKDAY_LABELS:
             entry = hours.setdefault(day, defaults_hours.get(day, {"open": "11:00", "mid": "16:00", "close": "23:00"}))
             entry.setdefault("mid", entry.get("close", "16:00"))
         self.policy_data.setdefault("timeblocks", defaults.get("timeblocks", {}))
+
+    @staticmethod
+    def _disable_scroll_wheel(widgets: List[Optional[QWidget]]) -> None:
+        for widget in widgets:
+            if widget is None:
+                continue
+            widget.setFocusPolicy(Qt.StrongFocus)
+            widget.wheelEvent = lambda event: event.ignore()
 
 
 class EmployeeEditDialog(QDialog):
@@ -3901,12 +3964,15 @@ class WageManagerDialog(QDialog):
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
-        intro = QLabel("Set each role's hourly wage. Confirmed rows show a green check. Import/export uses JSON files.")
+        intro = QLabel(
+            "Set each role's hourly wage. Green = confirmed, yellow = needs confirmation, red = missing. "
+            "Editing a wage clears confirmation until you re-confirm."
+        )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         self.table = QTableWidget(len(self.roles), 4)
-        self.table.setHorizontalHeaderLabels(["Status", "Role", "Hourly wage ($)", "Confirmed"])
+        self.table.setHorizontalHeaderLabels(["Status", "Role", "Hourly wage ($)", "Confirm"])
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -3918,6 +3984,10 @@ class WageManagerDialog(QDialog):
         defaults_button = QPushButton("Reset to defaults")
         defaults_button.clicked.connect(self._handle_reset)
         controls.addWidget(defaults_button)
+
+        confirm_all_button = QPushButton("Confirm all")
+        confirm_all_button.clicked.connect(self._handle_confirm_all)
+        controls.addWidget(confirm_all_button)
 
         import_button = QPushButton("Import…")
         import_button.clicked.connect(self._handle_import)
@@ -3955,18 +4025,12 @@ class WageManagerDialog(QDialog):
             spin.setSingleStep(0.25)
             entry = data.get(role, baseline.get(role, {}))
             spin.setValue(float(entry.get("wage", 0.0) or 0.0))
-            spin.valueChanged.connect(lambda _value, r=role: self._update_status(r))
+            spin.valueChanged.connect(lambda _value, r=role: self._handle_wage_change(r))
             self.table.setCellWidget(row, 2, spin)
-            checkbox = QCheckBox()
+            checkbox = QCheckBox("Confirm")
             checkbox.setChecked(bool(entry.get("confirmed", False)))
             checkbox.stateChanged.connect(lambda _state, r=role: self._update_status(r))
-            container = QWidget()
-            container_layout = QHBoxLayout(container)
-            container_layout.setContentsMargins(0, 0, 0, 0)
-            container_layout.addStretch()
-            container_layout.addWidget(checkbox)
-            container_layout.addStretch()
-            self.table.setCellWidget(row, 3, container)
+            self.table.setCellWidget(row, 3, checkbox)
             self.wage_inputs[role] = spin
             self.confirm_boxes[role] = checkbox
             self.status_items[role] = status_item
@@ -3987,6 +4051,11 @@ class WageManagerDialog(QDialog):
         else:
             status_item.setText("!")
             status_item.setForeground(Qt.red)
+
+    def _handle_wage_change(self, role: str) -> None:
+        if role in self.confirm_boxes:
+            self.confirm_boxes[role].setChecked(False)
+        self._update_status(role)
 
     def _handle_reset(self) -> None:
         confirm = QMessageBox.question(
@@ -4029,6 +4098,12 @@ class WageManagerDialog(QDialog):
             return
         export_wages_file(Path(file_path))
         QMessageBox.information(self, "Export complete", f"Saved role wages to {file_path}.")
+
+    def _handle_confirm_all(self) -> None:
+        for checkbox in self.confirm_boxes.values():
+            checkbox.setChecked(True)
+        for role in self.roles:
+            self._update_status(role)
 
     def accept(self) -> None:  # type: ignore[override]
         payload: Dict[str, Dict[str, Any]] = {}
@@ -4825,6 +4900,9 @@ class MainWindow(QMainWindow):
             "Session timed out",
             "You were signed out due to inactivity.",
         )
+        app = QApplication.instance()
+        if app:
+            app.closeAllWindows()
         self.close()
 
     def eventFilter(self, source, event) -> bool:

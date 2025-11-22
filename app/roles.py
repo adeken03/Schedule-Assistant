@@ -4,7 +4,7 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 
 ROLE_GROUPS: Dict[str, List[str]] = {
-    "Heart of House": [
+    "Kitchen": [
         "Kitchen Opener",
         "Kitchen Closer",
         "Expo",
@@ -30,7 +30,7 @@ ROLE_GROUPS: Dict[str, List[str]] = {
         "Bartender - Opener",
         "Bartender - Closer",
     ],
-    "Cashier & Takeout": [
+    "Cashier": [
         "Cashier",
         "Cashier - To-Go Specialist",
         "Host",
@@ -38,10 +38,10 @@ ROLE_GROUPS: Dict[str, List[str]] = {
 }
 
 ROLE_COLORS: Dict[str, str] = {
-    "Heart of House": "#2f3a4f",
+    "Kitchen": "#2f3a4f",
     "Servers": "#1c4641",
     "Bartenders": "#4a1f43",
-    "Cashier & Takeout": "#4a3a1f",
+    "Cashier": "#4a3a1f",
     "Other": "#2f2f2f",
 }
 
@@ -49,16 +49,16 @@ _KEYWORD_RULES: List[Tuple[str, str]] = [
     ("server", "Servers"),
     ("bartend", "Bartenders"),
     ("bar", "Bartenders"),
-    ("cashier", "Cashier & Takeout"),
-    ("to-go", "Cashier & Takeout"),
-    ("host", "Cashier & Takeout"),
-    ("expo", "Heart of House"),
-    ("kitchen", "Heart of House"),
-    ("cook", "Heart of House"),
-    ("prep", "Heart of House"),
-    ("grill", "Heart of House"),
-    ("chip", "Heart of House"),
-    ("shake", "Heart of House"),
+    ("cashier", "Cashier"),
+    ("to-go", "Cashier"),
+    ("host", "Cashier"),
+    ("expo", "Kitchen"),
+    ("kitchen", "Kitchen"),
+    ("cook", "Kitchen"),
+    ("prep", "Kitchen"),
+    ("grill", "Kitchen"),
+    ("chip", "Kitchen"),
+    ("shake", "Kitchen"),
 ]
 
 
@@ -77,6 +77,10 @@ def role_group(role: str) -> str:
     label = normalize_role(role)
     if not label:
         return "Other"
+    if "heart of house" in label:
+        return "Kitchen"
+    if "cashier & takeout" in label:
+        return "Cashier"
     for group, names in ROLE_GROUPS.items():
         for name in names:
             if label == normalize_role(name):

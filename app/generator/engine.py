@@ -22,11 +22,16 @@ from database import (
     upsert_shift,
 )
 from policy import (
+    PATTERN_TEMPLATES,
+    anchor_rules,
     build_default_policy,
+    close_minutes,
     hourly_wage,
     open_minutes,
     resolve_policy_block,
     role_definition,
+    parse_time_label,
+    shift_length_limits,
     shift_length_rule,
 )
 from roles import is_manager_role, normalize_role, role_matches, role_group
@@ -96,18 +101,30 @@ class ScheduleGenerator:
         self.role_group_settings: Dict[str, Dict[str, Any]] = self._load_role_group_settings()
         self.group_budget_by_day: List[Dict[str, float]] = []
         self.warnings: List[str] = []
-        self.interchangeable_groups: Set[str] = {"Cashier & Takeout"}
+        self.interchangeable_groups: Set[str] = {"Cashier"}
         self.random = random.Random()
         self.group_pressure: Dict[int, Dict[str, float]] = {}
         self.cut_priority_rank: Dict[str, int] = {
             "Cashier": 0,
-            "Cashier & Takeout": 0,
             "Servers": 1,
-            "Heart of House": 2,
             "Kitchen": 2,
             "Bartenders": 3,
             "Other": 2,
         }
+        self.trim_aggressive_ratio: float = float(global_cfg.get("trim_aggressive_ratio", 1.0) or 1.0)
+        self.anchors = anchor_rules(self.policy)
+        order_mode = (self.anchors.get("open_close_order") or "prefer").strip().lower()
+        self.open_close_order_mode = order_mode if order_mode in {"off", "prefer", "enforce"} else "prefer"
+        self.group_aliases = {"heart of house": "Kitchen", "cashier & takeout": "Cashier"}
+        self.non_cuttable_roles: Set[str] = {
+            normalize_role(role) for role in (self.anchors.get("non_cuttable_roles") or [])
+        }
+        self.pattern_templates: Dict[str, Any] = {}
+        raw_patterns = self.policy.get("pattern_templates") if isinstance(self.policy, dict) else {}
+        if isinstance(raw_patterns, dict) and raw_patterns:
+            self.pattern_templates = raw_patterns
+        else:
+            self.pattern_templates = PATTERN_TEMPLATES
 
     @staticmethod
     def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -406,6 +423,13 @@ class ScheduleGenerator:
                         continue
                     _, start_dt, end_dt = resolved
                     start_dt, end_dt = self._adjust_block_window(role_name, block_name, date_value, start_dt, end_dt)
+                    pattern_windows = self._pattern_windows(
+                        role_name,
+                        date_value,
+                        block_label,
+                        anchor_start=start_dt,
+                        anchor_end=end_dt,
+                    )
                     need = self._calculate_block_need(role_name, role_cfg, block_cfg, block_name, day_index)
                     if need <= 0:
                         continue
@@ -425,24 +449,59 @@ class ScheduleGenerator:
                     need = max(minimum, need)
                     rate = self._role_wage(role_name)
                     labels = [block_name]
-                    demands.append(
-                        BlockDemand(
-                            day_index=day_index,
-                            date=date_value,
-                            start=start_dt,
-                            end=end_dt,
-                            role=role_name,
-                            block_name=block_name,
-                            labels=labels,
-                            need=need,
-                            priority=float(role_cfg.get("priority", 1.0)),
-                            minimum=minimum,
-                            allow_cuts=allow_cuts,
-                            always_on=always_on,
-                            role_group=group_name,
-                            hourly_rate=rate,
+                    if pattern_windows:
+                        windows = pattern_windows
+                        slots = need
+                        mins = minimum
+                        count = len(windows)
+                        base_each = slots // count
+                        remainder = slots % count
+                        min_each = mins // count
+                        min_rem = mins % count
+                        for idx, (p_start, p_end) in enumerate(windows):
+                            slot_need = base_each + (1 if idx < remainder else 0)
+                            slot_min = min_each + (1 if idx < min_rem else 0)
+                            if slot_need <= 0 and slot_min <= 0:
+                                continue
+                            slot_need = max(slot_need, slot_min)
+                            demand_labels = list(labels)
+                            demands.append(
+                                BlockDemand(
+                                    day_index=day_index,
+                                    date=date_value,
+                                    start=p_start,
+                                    end=p_end,
+                                    role=role_name,
+                                    block_name=block_name,
+                                    labels=demand_labels,
+                                    need=slot_need,
+                                    priority=float(role_cfg.get("priority", 1.0)),
+                                    minimum=slot_min,
+                                    allow_cuts=allow_cuts,
+                                    always_on=always_on,
+                                    role_group=group_name,
+                                    hourly_rate=rate,
+                                )
+                            )
+                    else:
+                        demands.append(
+                            BlockDemand(
+                                day_index=day_index,
+                                date=date_value,
+                                start=start_dt,
+                                end=end_dt,
+                                role=role_name,
+                                block_name=block_name,
+                                labels=labels,
+                                need=need,
+                                priority=float(role_cfg.get("priority", 1.0)),
+                                minimum=minimum,
+                                allow_cuts=allow_cuts,
+                                always_on=always_on,
+                                role_group=group_name,
+                                hourly_rate=rate,
+                            )
                         )
-                    )
         self._enforce_anchor_shift_caps(demands)
         self._apply_labor_allocations(demands)
         self._record_group_pressure(demands)
@@ -482,9 +541,17 @@ class ScheduleGenerator:
                 buffered_start = day_start
             if start_dt > buffered_start:
                 start_dt = buffered_start
-        if self.close_buffer_minutes and not is_cashier and any(keyword in normalized_role for keyword in closer_keywords):
-            buffer_minutes = self._round_minutes(max(0, self.close_buffer_minutes))
-            end_dt += datetime.timedelta(minutes=buffer_minutes)
+        # Apply pattern templates for Open/Mid/PM blocks to align with user-provided shift shapes
+        # without moving the policy-driven start time.
+        window_override = self._pattern_window(
+            role_name,
+            date_value,
+            block_label,
+            anchor_start=start_dt,
+            anchor_end=end_dt,
+        )
+        if window_override:
+            _anchored_start, end_dt = window_override
         return start_dt, end_dt
 
 
@@ -496,6 +563,83 @@ class ScheduleGenerator:
             return sales * modifier_multiplier
         return 0.0
 
+    def _pattern_window(
+        self,
+        role_name: str,
+        date_value: datetime.date,
+        block_label: str,
+        *,
+        anchor_start: Optional[datetime.datetime] = None,
+        anchor_end: Optional[datetime.datetime] = None,
+    ) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
+        windows = self._pattern_windows(
+            role_name,
+            date_value,
+            block_label,
+            anchor_start=anchor_start,
+            anchor_end=anchor_end,
+        )
+        return windows[0] if windows else None
+
+    def _pattern_windows(
+        self,
+        role_name: str,
+        date_value: datetime.date,
+        block_label: str,
+        *,
+        anchor_start: Optional[datetime.datetime] = None,
+        anchor_end: Optional[datetime.datetime] = None,
+    ) -> List[Tuple[datetime.datetime, datetime.datetime]]:
+        if block_label not in {"open", "mid", "pm"}:
+            return []
+        day_token = WEEKDAY_TOKENS[date_value.weekday()]
+        group_name = self._canonical_group(role_group(role_name))
+        templates = self.pattern_templates.get(group_name) or self.pattern_templates.get(role_name)
+        if not isinstance(templates, dict):
+            return []
+        day_spec = templates.get(day_token) or templates.get("default")
+        if not isinstance(day_spec, dict):
+            return []
+        block_key = "am" if block_label in {"open", "mid"} else "pm"
+        windows = day_spec.get(block_key)
+        parsed: List[Tuple[datetime.datetime, datetime.datetime]] = []
+        if not isinstance(windows, list):
+            return parsed
+        for window in windows:
+            parsed_window = self._parse_pattern_window(date_value, window)
+            if not parsed_window:
+                continue
+            start_dt, end_dt = parsed_window
+            if anchor_start:
+                duration = end_dt - start_dt
+                if duration.total_seconds() <= 0:
+                    continue
+                anchored_start = anchor_start
+                anchored_end = anchor_start + duration
+                if anchor_end and anchored_end > anchor_end:
+                    anchored_end = anchor_end
+                if anchored_end <= anchored_start:
+                    continue
+                parsed_window = (anchored_start, anchored_end)
+            parsed.append(parsed_window)
+        return parsed
+
+    def _parse_pattern_window(
+        self, date_value: datetime.date, window: Dict[str, Any]
+    ) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
+        if not isinstance(window, dict):
+            return None
+        start_label = window.get("start")
+        end_label = window.get("end")
+        start_minutes = parse_time_label(str(start_label)) if start_label is not None else None
+        end_minutes = parse_time_label(str(end_label)) if end_label is not None else None
+        if start_minutes is None or end_minutes is None:
+            return None
+        base = datetime.datetime.combine(date_value, datetime.time.min, tzinfo=UTC)
+        start_dt = base + datetime.timedelta(minutes=int(start_minutes))
+        end_dt = base + datetime.timedelta(minutes=int(end_minutes))
+        return start_dt, end_dt
+
     def _calculate_block_need(
         self,
         role_name: str,
@@ -505,6 +649,7 @@ class ScheduleGenerator:
         day_index: int,
     ) -> int:
         block_label = (block_name or "").strip().lower()
+        always_on = bool(role_cfg.get("always_on", False))
         base = int(block_cfg.get("base", block_cfg.get("min", 0)))
         min_staff = int(block_cfg.get("min", base))
         if min_staff <= 0 and base > 0:
@@ -524,29 +669,26 @@ class ScheduleGenerator:
             if not self._role_allows_open_shift(role_name):
                 return 0
             need = 1 if need > 0 else 0
-
-        group_name = role_group(role_name)
         demand_index = 1.0
         if 0 <= day_index < len(self.day_contexts):
             demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
-        if group_name == "Servers" and block_label in {"mid", "pm"}:
-            if "dining" in normalize_role(role_name):
-                floor = 3
-                if demand_index >= 0.7:
-                    floor = 4
-                if demand_index >= 1.0:
-                    floor = 5
-                need = max(need, floor)
-            elif "cocktail" in normalize_role(role_name):
-                floor = 1
-                if demand_index >= 0.6:
-                    floor = 2
-                if demand_index >= 0.9:
-                    floor = 3
-                need = max(need, floor)
-            elif "patio" in normalize_role(role_name):
-                if demand_index >= 0.8:
-                    need = max(need, 1)
+        if not role_cfg.get("critical") and not always_on and block_label in {"mid", "pm"}:
+            if demand_index < 0.45:
+                need = min(need, min_staff)
+        floor_rules = block_cfg.get("floor_by_demand", []) if isinstance(block_cfg, dict) else []
+        if isinstance(floor_rules, list):
+            for rule in floor_rules:
+                if not isinstance(rule, dict):
+                    continue
+                gte = rule.get("gte")
+                minimum_floor = rule.get("min")
+                try:
+                    gte_val = float(gte)
+                    floor_val = int(minimum_floor)
+                except (TypeError, ValueError):
+                    continue
+                if demand_index >= gte_val:
+                    need = max(need, floor_val)
         need = max(min_staff, need)
         if max_staff > 0:
             need = min(max_staff, need)
@@ -561,9 +703,18 @@ class ScheduleGenerator:
         if isinstance(role_cfg, dict):
             explicit = (role_cfg.get("group") or "").strip()
         if explicit:
-            return explicit
+            return self._canonical_group(explicit)
         inferred = role_group(role_name)
-        return inferred if inferred else "Other"
+        return self._canonical_group(inferred if inferred else "Other")
+
+    def _canonical_group(self, name: str) -> str:
+        label = (name or "").strip()
+        normalized = label.lower()
+        if normalized in self.group_aliases:
+            return self.group_aliases[normalized]
+        if label:
+            return label
+        return "Other"
 
     def _apply_labor_allocations(self, demands: List[BlockDemand]) -> None:
         if not demands or not self.role_group_settings or not self.group_budget_by_day:
@@ -580,16 +731,35 @@ class ScheduleGenerator:
             budget = payload.get("budget")
             if budget is None or budget <= 0:
                 continue
-            allowed_max = budget * (1 + self.labor_budget_tolerance)
             total_cost = sum(self._slot_cost(demand) * demand.need for demand in payload["demands"])
-            if total_cost <= allowed_max + 0.01:
+            ratio = total_cost / budget if budget > 0 else 0.0
+            if ratio <= 1.0:
                 continue
+            soft_mode = ratio <= (1.0 + self.labor_budget_tolerance + 1e-6)
+            allowed_max = budget * (1 + self.labor_budget_tolerance)
+            demand_index = 1.0
+            if 0 <= day_index < len(self.day_contexts):
+                demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
+            if demand_index < 0.9:
+                # Clamp allowed spend on soft/slow days so headcount is pulled sooner.
+                slow_penalty = max(0.6, 0.5 + 0.5 * demand_index)
+                allowed_max *= slow_penalty
+            if not soft_mode and self.trim_aggressive_ratio > 0:
+                allowed_max = min(allowed_max, budget * self.trim_aggressive_ratio)
+            if ratio > 1.0:
+                for demand in payload["demands"]:
+                    if not self._is_anchor_demand(demand):
+                        demand.minimum = min(demand.minimum, 0)
             removable: List[Tuple[float, float, BlockDemand]] = []
             for demand in payload["demands"]:
                 if not demand.allow_cuts or demand.need <= demand.minimum:
                     continue
                 slots = demand.need - demand.minimum
                 if slots <= 0:
+                    continue
+                if self._is_anchor_demand(demand):
+                    continue
+                if soft_mode and demand.priority >= 1.0:
                     continue
                 slot_cost = self._slot_cost(demand)
                 removable.extend([(slot_cost, demand.priority, demand)] * slots)
@@ -635,59 +805,62 @@ class ScheduleGenerator:
         self.group_pressure = pressure
 
     def _enforce_anchor_shift_caps(self, demands: List[BlockDemand]) -> None:
-        """Ensure opener/closer counts match invariants (1 per group, no cashier closers)."""
+        """Ensure opener/closer counts match policy anchors."""
         if not demands:
             return
-        open_caps: Dict[str, List[str]] = {
-            "Kitchen": ["kitchen opener"],
-            "Heart of House": ["kitchen opener"],
-            "Bartenders": ["bartender - opener", "bartender"],
-            "Servers": [
-                "server - dining opener",
-                "server - cocktail opener",
-                "server - dining",
-                "server - cocktail",
-                "server",
-            ],
-        }
-        close_slots: Dict[str, List[List[str]]] = {
-            "Bartenders": [["bartender - closer", "bartender"]],
-            "Kitchen": [["kitchen closer"]],
-            "Heart of House": [["kitchen closer"]],
-            "Servers": [
-                ["server - dining closer", "server - dining", "server"],
-                ["server - cocktail closer", "server - cocktail", "server"],
-            ],
-        }
-        blocked_close_groups = {"Cashier", "Cashier & Takeout"}
+        opener_caps = {self._canonical_group(k): v for k, v in (self.anchors.get("openers") or {}).items()}
+        closer_caps = {self._canonical_group(k): v for k, v in (self.anchors.get("closers") or {}).items()}
+        opener_roles = {self._canonical_group(k): [normalize_role(r) for r in v] for k, v in (self.anchors.get("opener_roles") or {}).items()}
+        closer_roles = {self._canonical_group(k): [normalize_role(r) for r in v] for k, v in (self.anchors.get("closer_roles") or {}).items()}
+        allow_cashier_close = bool(self.anchors.get("allow_cashier_closer", False))
 
         by_day: Dict[int, List[BlockDemand]] = {}
         for demand in demands:
             by_day.setdefault(demand.day_index, []).append(demand)
 
         for day_demands in by_day.values():
-            self._apply_opener_caps(day_demands, open_caps)
-            self._apply_closer_caps(day_demands, close_slots, blocked_close_groups)
+            self._apply_anchor_caps(day_demands, opener_caps, opener_roles, block_label="open")
+            blocked_groups = set()
+            if not allow_cashier_close:
+                blocked_groups.add("Cashier")
+            self._apply_anchor_caps(day_demands, closer_caps, closer_roles, block_label="close", blocked_groups=blocked_groups)
+            self._dedupe_anchor_assignments(day_demands, "open")
 
-    def _apply_opener_caps(self, day_demands: List[BlockDemand], caps: Dict[str, List[str]]) -> None:
-        open_demands = [
-            demand for demand in day_demands if demand.block_name.strip().lower() == "open"
-        ]
-        if not open_demands:
+    def _apply_anchor_caps(
+        self,
+        day_demands: List[BlockDemand],
+        caps: Dict[str, int],
+        role_preferences: Dict[str, List[str]],
+        *,
+        block_label: str,
+        blocked_groups: Optional[Set[str]] = None,
+    ) -> None:
+        targets = [d for d in day_demands if d.block_name.strip().lower() == block_label]
+        if not targets:
             return
-        for demand in list(open_demands):
+        blocked_groups = blocked_groups or set()
+        for demand in list(targets):
+            if demand.role_group in blocked_groups:
+                demand.need = 0
+                demand.minimum = 0
+        for demand in list(targets):
             if demand.role_group not in caps:
                 demand.need = 0
                 demand.minimum = 0
-        for group_name, preferred_roles in caps.items():
-            candidates = [d for d in open_demands if d.role_group == group_name and d.need >= 0]
+        for group_name, count in caps.items():
+            if count <= 0:
+                for demand in [d for d in targets if d.role_group == group_name]:
+                    demand.need = 0
+                    demand.minimum = 0
+                continue
+            candidates = [d for d in targets if d.role_group == group_name and d.need >= 0]
             if not candidates:
                 continue
-            chosen = self._pick_preferred_candidate(candidates, preferred_roles)
-            if not chosen:
-                continue
+            prefs = role_preferences.get(group_name, [])
+            chosen_list = self._pick_preferred_candidates(candidates, prefs, count)
+            chosen_set = {id(item) for item in chosen_list}
             for demand in candidates:
-                if demand is chosen:
+                if id(demand) in chosen_set:
                     demand.need = 1
                     demand.minimum = max(1, demand.minimum)
                     demand.allow_cuts = False
@@ -695,50 +868,12 @@ class ScheduleGenerator:
                     demand.need = 0
                     demand.minimum = 0
 
-    def _apply_closer_caps(
-        self,
-        day_demands: List[BlockDemand],
-        slots: Dict[str, List[List[str]]],
-        blocked_groups: Set[str],
-    ) -> None:
-        close_demands = [
-            demand for demand in day_demands if demand.block_name.strip().lower() == "close"
-        ]
-        if not close_demands:
-            return
-        for demand in close_demands:
-            if demand.role_group in blocked_groups:
-                demand.need = 0
-                demand.minimum = 0
-        for demand in list(close_demands):
-            if demand.need <= 0:
-                continue
-            if demand.role_group not in slots:
-                demand.need = 0
-                demand.minimum = 0
-        for group_name, role_slots in slots.items():
-            group_demands = [d for d in close_demands if d.role_group == group_name and d.need > 0]
-            if not group_demands:
-                continue
-            available = list(group_demands)
-            for role_preferences in role_slots:
-                candidates = [d for d in available if normalize_role(d.role) in role_preferences]
-                chosen = self._pick_preferred_candidate(candidates or available, role_preferences)
-                if not chosen:
-                    continue
-                chosen.need = 1
-                chosen.minimum = max(1, chosen.minimum)
-                chosen.allow_cuts = False
-                if chosen in available:
-                    available.remove(chosen)
-            for demand in available:
-                demand.need = 0
-                demand.minimum = 0
-
     @staticmethod
-    def _pick_preferred_candidate(candidates: List[BlockDemand], preferred_roles: List[str]) -> Optional[BlockDemand]:
-        if not candidates:
-            return None
+    def _pick_preferred_candidates(
+        candidates: List[BlockDemand], preferred_roles: List[str], target_count: int
+    ) -> List[BlockDemand]:
+        if not candidates or target_count <= 0:
+            return []
         normalized_preferences = [normalize_role(role) for role in preferred_roles]
 
         def rank(demand: BlockDemand) -> Tuple[int, float]:
@@ -749,20 +884,73 @@ class ScheduleGenerator:
                 preferred_index = len(normalized_preferences)
             return (preferred_index, -demand.priority)
 
-        return sorted(candidates, key=rank)[0]
+        return sorted(candidates, key=rank)[:target_count]
+
+    @staticmethod
+    def _dedupe_anchor_assignments(day_demands: List[BlockDemand], block_label: str) -> None:
+        seen: Set[Tuple[str, str]] = set()
+        for demand in sorted(
+            [d for d in day_demands if d.block_name.strip().lower() == block_label],
+            key=lambda d: (-d.priority, d.start),
+        ):
+            key = (demand.role_group, demand.block_name.strip().lower())
+            if demand.need > 0 and key not in seen:
+                seen.add(key)
+                continue
+            if demand.need > 0:
+                demand.need = 0
+                demand.minimum = 0
 
     def _annotate_cut_windows(self, demands: List[BlockDemand]) -> None:
         if not demands:
             return
+        # First pass: generate base cut candidates.
+        candidates: List[BlockDemand] = []
         for demand in demands:
-            if demand.need <= demand.minimum:
-                continue
-            if not demand.allow_cuts:
+            if demand.need <= 0 or not demand.allow_cuts:
                 continue
             cut_time = self._recommend_cut_time(demand)
-            if cut_time:
-                demand.recommended_cut = cut_time
-                label = f"cut around {cut_time.strftime('%H:%M')}"
+            if not cut_time:
+                continue
+            demand.recommended_cut = cut_time
+            candidates.append(demand)
+
+        if not candidates:
+            return
+
+        # Second pass: stagger within each day/group to avoid all cuts firing at once
+        # and pull harder when a group is over budget for that day.
+        by_day_group: Dict[Tuple[int, str], List[BlockDemand]] = {}
+        for d in candidates:
+            key = (d.day_index, d.role_group)
+            by_day_group.setdefault(key, []).append(d)
+
+        for (day_idx, group), bucket in by_day_group.items():
+            pressure = self.group_pressure.get(day_idx, {}).get(group, 1.0)
+            stagger_step = 10
+            if pressure >= 1.1:
+                stagger_step = 15
+            if pressure >= 1.3:
+                stagger_step = 20
+            # Sort by start time then priority so earliest shifts cut first.
+            bucket.sort(key=lambda b: (b.start, -b.priority, b.recommended_cut or b.end))
+            for offset, demand in enumerate(bucket):
+                slot_cut = demand.recommended_cut or demand.end
+                # Pull earlier if budget pressure is high for that group/day.
+                if pressure > 1.0:
+                    extra_pull = int(min(120, 30 + (pressure - 1.0) * 90))
+                    slot_cut = slot_cut - datetime.timedelta(minutes=extra_pull)
+                # Stagger to avoid simultaneous releases.
+                slot_cut = slot_cut - datetime.timedelta(minutes=stagger_step * offset)
+                # Enforce minimum shift length and not after original end.
+                min_hours, max_hours = shift_length_limits(self.policy, demand.role, demand.role_group)
+                min_duration = datetime.timedelta(minutes=int(min_hours * 60))
+                if slot_cut < demand.start + min_duration:
+                    slot_cut = demand.start + min_duration
+                if slot_cut >= demand.end:
+                    continue
+                demand.recommended_cut = slot_cut
+                label = f"cut around {slot_cut.strftime('%H:%M')}"
                 if label not in demand.labels:
                     demand.labels.append(label)
 
@@ -774,6 +962,7 @@ class ScheduleGenerator:
 
         role_cfg = self.roles_config.get(demand.role, {})
         group_cfg = self.role_group_settings.get(demand.role_group, {})
+        group_name = demand.role_group
         base_buffer = role_cfg.get("cut_buffer_minutes", group_cfg.get("cut_buffer_minutes", 30))
         try:
             buffer_minutes = int(base_buffer)
@@ -786,53 +975,73 @@ class ScheduleGenerator:
 
         pressure_ratio = self.group_pressure.get(demand.day_index, {}).get(demand.role_group, 1.0)
         priority_rank = self.cut_priority_rank.get(demand.role_group, 2)
-        min_hours = shift_length_rule(role_cfg).get("minHrs", 3)
-        try:
-            min_hours = float(min_hours)
-        except (TypeError, ValueError):
-            min_hours = 3.0
-        group_name = demand.role_group
-        if group_name in {"Cashier", "Cashier & Takeout"}:
-            min_hours = max(2.0, min_hours - 2.5)
-        elif group_name == "Servers":
-            min_hours = max(3.5, min_hours - 1.0)
-        else:
-            min_hours = max(3.0, min_hours - 1.5)
+        min_hours, max_hours = shift_length_limits(self.policy, demand.role, demand.role_group)
+        # Allow faster releases than the nominal minimum when trimming: 1.5h floor for non-closers.
+        if not self._is_closer_block(demand.role, demand.block_name):
+            min_hours = min(min_hours, 1.5)
 
         normalized_role = normalize_role(demand.role)
-        demand_softness = max(0.0, 0.9 - demand_index)
+        demand_softness = max(0.0, 1.0 - demand_index)  # softer = closer to 1
         pressure_factor = max(0.0, pressure_ratio - 1.0)
-        cashier_bias = 0.0
-        if "cashier" in normalized_role or "takeout" in normalized_role or "to-go" in normalized_role:
-            cashier_bias = 0.35
+        cashier_bias = 1.0 if ("cashier" in normalized_role or "takeout" in normalized_role or "to-go" in normalized_role) else 0.0
 
         group_bias = 0
-        if group_name in {"Cashier", "Cashier & Takeout"}:
-            group_bias = 60
-        elif group_name in {"Heart of House", "Kitchen"}:
-            group_bias = 45
-        elif group_name == "Servers":
-            group_bias = 15
+        if group_name in {"Cashier"}:
+            group_bias = 90
+        elif group_name in {"Servers"}:
+            group_bias = 70
+        elif group_name in {"Kitchen"}:
+            group_bias = 55
         else:
-            group_bias = 10
+            group_bias = 35
 
         # Pull earlier when demand is soft or the group is over budget.
-        early_pull_minutes = int(demand_softness * 90) + int(
-            min(240, (pressure_factor * 140) + priority_rank * 12 + group_bias)
+        early_pull_minutes = int(demand_softness * 150) + int(
+            min(320, (pressure_factor * 260) + priority_rank * 24 + group_bias)
         )
-        if pressure_ratio >= 1.5:
-            early_pull_minutes += 40
+        if pressure_ratio >= 1.2:
+            early_pull_minutes += 30
+        if pressure_ratio >= 1.4:
+            early_pull_minutes += 45
+        if pressure_ratio >= 1.7:
+            early_pull_minutes += 55
         if pressure_ratio >= 2.0:
-            early_pull_minutes += 40
+            early_pull_minutes += 70
         if cashier_bias:
-            early_pull_minutes += int(30 * cashier_bias)
+            early_pull_minutes += 45
 
         buffer_minutes = max(0, buffer_minutes + early_pull_minutes)
         candidate = demand.end - datetime.timedelta(minutes=buffer_minutes)
 
+        block_lower = demand.block_name.strip().lower()
+        block_len = demand.end - demand.start
+        if block_len.total_seconds() > 0:
+            softness = max(0.0, 1.0 - demand_index)
+            if block_lower == "mid":
+                target_frac = 0.5 - 0.25 * softness
+            elif block_lower == "pm":
+                target_frac = 0.6 - 0.22 * softness
+            else:
+                target_frac = 0.7 - 0.18 * softness
+            target_frac = max(0.3, min(0.85, target_frac))
+            duration_target = block_len.total_seconds() * target_frac
+            # Scale harder when the group is over budget to hit closer to 100% of allocation.
+            if pressure_ratio > 1.0:
+                budget_scale = max(0.25, 1.0 / min(2.5, pressure_ratio + 0.1))
+                duration_target = min(duration_target, block_len.total_seconds() * budget_scale)
+            target_time = demand.start + datetime.timedelta(seconds=duration_target)
+            if target_time < candidate:
+                candidate = target_time
+
         min_duration = datetime.timedelta(minutes=int(min_hours * 60))
+        max_span = datetime.timedelta(minutes=int(max_hours * 60))
         if candidate < demand.start + min_duration:
             candidate = demand.start + min_duration
+        if demand.end - demand.start > max_span:
+            # Encourage earlier cuts to respect max shift length.
+            max_candidate = demand.start + max_span
+            if candidate > max_candidate:
+                candidate = max_candidate
         if candidate >= demand.end:
             return None
         return candidate
@@ -847,6 +1056,11 @@ class ScheduleGenerator:
     @staticmethod
     def _slot_cost(demand: BlockDemand) -> float:
         return max(0.0, demand.duration_hours * max(0.0, demand.hourly_rate or 0.0))
+
+    @staticmethod
+    def _compute_cost(start: datetime.datetime, end: datetime.datetime, rate: float) -> float:
+        hours = max(0.0, (end - start).total_seconds() / 3600)
+        return round(hours * max(0.0, rate or 0.0), 2)
 
     def _day_label(self, day_index: int) -> str:
         if 0 <= day_index < len(self.day_contexts):
@@ -870,6 +1084,8 @@ class ScheduleGenerator:
             "server",
             "server - dining",
             "server - dining opener",
+            "server - cocktail",
+            "server - cocktail opener",
         }
         return normalized_role in allowed
 
@@ -878,6 +1094,18 @@ class ScheduleGenerator:
         if not normalized_role:
             return False
         return "closer" in normalized_role and block_name.strip().lower() == "close"
+
+    def _is_anchor_demand(self, demand: BlockDemand) -> bool:
+        normalized_role = normalize_role(demand.role)
+        role_cfg = role_definition(self.policy, demand.role)
+        return (
+            normalized_role in self.non_cuttable_roles
+            or not demand.allow_cuts
+            or self._is_closer_block(demand.role, demand.block_name)
+            or self._is_opener_block(demand.role, demand.block_name)
+            or demand.always_on
+            or bool(role_cfg.get("critical"))
+        )
 
     def _demand_window_minutes(self, demand: BlockDemand) -> Tuple[int, int]:
         start_delta_days = (demand.start.date() - demand.date).days
@@ -976,18 +1204,220 @@ class ScheduleGenerator:
         if not batch:
             return results
         for demand, count in sorted(batch, key=order_key):
+            entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]] = []
             for _ in range(count):
                 candidate = self._select_employee(demand)
                 if not candidate:
-                    results.append(self._build_assignment_payload(None, demand))
+                    entries.append((self._build_assignment_payload(None, demand, override_end=demand.end), None))
                     self.warnings.append(
                         f"No coverage for {demand.role} on {demand.date.isoformat()} "
                         f"{demand.start.strftime('%H:%M')} - {demand.end.strftime('%H:%M')} ({demand.block_name})"
                     )
                     continue
-                results.append(self._build_assignment_payload(candidate, demand))
                 self._register_assignment(candidate, demand)
+                entries.append((self._build_assignment_payload(candidate, demand, override_end=demand.end), candidate))
+            self._apply_staggered_cuts_for_demand(demand, entries)
+            results.extend(payload for payload, _ in entries)
         return results
+
+    def _apply_staggered_cuts_for_demand(
+        self,
+        demand: BlockDemand,
+        entries: List[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]],
+    ) -> None:
+        """Stagger cut times within a block, prioritizing longest-worked staff first."""
+        if not entries:
+            return
+        base_labels = [
+            label
+            for label in demand.labels
+            if not label.lower().startswith("cut around") and label.lower() != "pattern"
+        ]
+        if not base_labels:
+            base_labels = [demand.block_name]
+        block_is_close = demand.block_name.strip().lower() == "close"
+        is_closer = self._is_closer_block(demand.role, demand.block_name) or block_is_close
+        min_hours, _ = shift_length_limits(self.policy, demand.role, demand.role_group)
+        if not is_closer:
+            min_hours = min(min_hours, 1.5)
+        min_duration = datetime.timedelta(minutes=int(min_hours * 60)) if not is_closer else datetime.timedelta()
+        block_len = demand.end - demand.start
+        if min_duration > block_len:
+            min_duration = block_len
+
+        latest_cut = demand.recommended_cut
+        if not demand.allow_cuts or not latest_cut:
+            for payload, employee in entries:
+                end_time = demand.end
+                if end_time < demand.start + min_duration:
+                    end_time = demand.start + min_duration
+                if end_time > demand.end:
+                    end_time = demand.end
+                self._finalize_assignment_payload(payload, employee, end_time, base_labels, demand)
+            return
+
+        total_slots = len(entries)
+        if total_slots <= 0:
+            return
+        core_slots = min(total_slots, max(0, demand.minimum))
+        cuttable_slots = max(0, total_slots - core_slots)
+
+        if latest_cut > demand.end:
+            latest_cut = demand.end
+        if latest_cut < demand.start + min_duration:
+            latest_cut = demand.start + min_duration
+
+        start_minutes, _ = self._demand_window_minutes(demand)
+        pressure = self.group_pressure.get(demand.day_index, {}).get(demand.role_group, 1.0)
+        demand_index = 1.0
+        if 0 <= demand.day_index < len(self.day_contexts):
+            demand_index = self.day_contexts[demand.day_index].get("indices", {}).get("demand_index", 1.0)
+
+        stagger_step = 12
+        if pressure >= 1.15:
+            stagger_step = 10
+        if pressure >= 1.35:
+            stagger_step = 8
+        if pressure >= 1.6:
+            stagger_step = 6
+        if demand_index < 0.9:
+            stagger_step += 3
+        stagger_step = max(4, min(20, stagger_step))
+
+        softness = max(0.0, 1.0 - demand_index)
+        jitter_range = int(round(softness * 4 + max(0.0, pressure - 1.0) * 3))
+
+        scored: List[Tuple[float, int]] = []
+        fifo_mode = self.open_close_order_mode
+        for idx, (_payload, employee) in enumerate(entries):
+            base_score = self._cut_priority_score(employee, demand, start_minutes, pressure)
+            fifo_bonus = 0.0
+            if fifo_mode in {"prefer", "enforce"}:
+                fifo_bonus = self._fifo_order_weight(employee, demand, start_minutes)
+            if fifo_mode == "enforce":
+                # Strong FIFO: base score secondary to start order.
+                score = (fifo_bonus * 5.0) + (base_score * 0.25)
+            elif fifo_mode == "prefer":
+                score = base_score + fifo_bonus
+            else:
+                score = base_score
+            scored.append((score, idx))
+        scored.sort(key=lambda item: item[0], reverse=True)
+
+        early_indices = [idx for _score, idx in scored[:cuttable_slots]]
+        planned_end_times: List[datetime.datetime] = [latest_cut for _ in entries]
+        planned_labels: List[List[str]] = [list(base_labels) for _ in entries]
+
+        span = max(datetime.timedelta(), latest_cut - (demand.start + min_duration))
+        span_minutes = max(0, int(span.total_seconds() // 60))
+        linear_step = span_minutes / max(1, len(early_indices) - 1) if len(early_indices) > 1 else span_minutes
+        linear_step = max(4, min(stagger_step, int(linear_step))) if linear_step > 0 else stagger_step
+
+        for order, idx in enumerate(early_indices):
+            payload, employee = entries[idx]
+            jitter = self.random.randint(-jitter_range, jitter_range) if jitter_range else 0
+            cut_time = latest_cut - datetime.timedelta(minutes=(linear_step * order) + jitter)
+            floor_time = demand.start + min_duration
+            if cut_time < floor_time:
+                cut_time = floor_time
+            if cut_time > latest_cut:
+                cut_time = latest_cut
+            planned_end_times[idx] = cut_time
+            planned_labels[idx] = base_labels + [f"{self._ordinal_label(order + 1)} cut around {cut_time.strftime('%H:%M')}"]
+
+        remaining_indices = [idx for _score, idx in scored if idx not in early_indices]
+        trailing_step = max(3, min(10, (stagger_step // 2) + 2))
+        for order, idx in enumerate(remaining_indices):
+            payload, employee = entries[idx]
+            back_offset = max(len(remaining_indices) - order - 1, 0)
+            cut_time = latest_cut - datetime.timedelta(minutes=trailing_step * back_offset)
+            if jitter_range and len(remaining_indices) > 1:
+                jitter = self.random.randint(0, jitter_range)
+                cut_time = cut_time - datetime.timedelta(minutes=jitter)
+            if cut_time < demand.start + min_duration:
+                cut_time = demand.start + min_duration
+            if cut_time > latest_cut:
+                cut_time = latest_cut
+            planned_end_times[idx] = cut_time
+            planned_labels[idx] = base_labels + [f"final cut around {cut_time.strftime('%H:%M')}"]
+
+        if self.open_close_order_mode != "off" and len(entries) > 1:
+            ordering: List[Tuple[int, datetime.datetime]] = []
+            for idx, (_payload, employee) in enumerate(entries):
+                earliest = start_minutes
+                if employee:
+                    day_assignments = employee["assignments"].get(demand.day_index, [])
+                    if day_assignments:
+                        earliest = min([start for start, _ in day_assignments] + [start_minutes])
+                ordering.append((earliest, planned_end_times[idx]))
+            ordering.sort(key=lambda item: item[0])
+            violation = False
+            for first, second in zip(ordering, ordering[1:]):
+                if first[1] > second[1] + datetime.timedelta(minutes=2):
+                    violation = True
+                    break
+            if violation:
+                self.warnings.append(
+                    f"Could not fully honor opener/closer order for {demand.role_group} on {self._day_label(demand.day_index)}; review cuts."
+                )
+
+        for idx, (payload, employee) in enumerate(entries):
+            self._finalize_assignment_payload(payload, employee, planned_end_times[idx], planned_labels[idx], demand)
+
+    def _finalize_assignment_payload(
+        self,
+        payload: Dict[str, Any],
+        employee: Optional[Dict[str, Any]],
+        end_time: datetime.datetime,
+        labels: List[str],
+        demand: BlockDemand,
+    ) -> None:
+        payload["end"] = end_time
+        payload["labor_cost"] = self._compute_cost(payload["start"], end_time, payload.get("labor_rate", 0.0))
+        payload["notes"] = ", ".join(labels)
+        if employee and end_time < demand.end:
+            delta_hours = max(0.0, (demand.end - end_time).total_seconds() / 3600)
+            employee["total_hours"] = max(0.0, employee.get("total_hours", 0.0) - delta_hours)
+
+    def _cut_priority_score(
+        self,
+        employee: Optional[Dict[str, Any]],
+        demand: BlockDemand,
+        start_minutes: int,
+        pressure: float,
+    ) -> float:
+        """Higher scores mean the employee should be released earlier."""
+        if not employee:
+            return float("-inf")
+        day_assignments = employee["assignments"].get(demand.day_index, [])
+        day_minutes = sum(end - start for start, end in day_assignments)
+        day_hours = day_minutes / 60.0
+        earliest_start = min((start for start, _ in day_assignments), default=start_minutes)
+        started_early = earliest_start < start_minutes
+        long_day_bonus = 1.5 if day_hours >= 7 else (0.75 if day_hours >= 5 else 0.0)
+        weekly_hours = employee.get("total_hours", 0.0)
+        pressure_bonus = max(0.0, pressure - 1.0) * 2.0
+        return (weekly_hours * 0.7) + (day_hours * 1.6) + (2.0 if started_early else 0.0) + long_day_bonus + pressure_bonus
+
+    def _fifo_order_weight(self, employee: Optional[Dict[str, Any]], demand: BlockDemand, start_minutes: int) -> float:
+        """Higher weight means this person should leave earlier based on earliest start (FIFO)."""
+        if not employee:
+            return 0.0
+        day_assignments = employee["assignments"].get(demand.day_index, [])
+        if not day_assignments:
+            return 0.0
+        earliest_start = min(start for start, _ in day_assignments)
+        age_minutes = max(0, start_minutes - earliest_start)
+        # 30 minute chunks, capped to avoid overpowering budget logic.
+        return min(6.0, age_minutes / 30.0)
+
+    @staticmethod
+    def _ordinal_label(value: int) -> str:
+        if 10 <= value % 100 <= 20:
+            suffix = "th"
+        else:
+            suffix = {1: "st", 2: "nd", 3: "rd"}.get(value % 10, "th")
+        return f"{value}{suffix}"
 
     def _select_employee(self, demand: BlockDemand) -> Optional[Dict[str, Any]]:
         for allow_overflow in (False, True):
@@ -1176,10 +1606,12 @@ class ScheduleGenerator:
         self,
         employee: Optional[Dict[str, Any]],
         demand: BlockDemand,
+        *,
+        override_end: Optional[datetime.datetime] = None,
     ) -> Dict[str, Any]:
         rate = self._role_wage(demand.role) if employee else 0.0
         start_time = demand.start
-        end_time = demand.recommended_cut or demand.end
+        end_time = override_end or demand.recommended_cut or demand.end
         if end_time <= start_time:
             end_time = demand.end
         hours = max(0.0, (end_time - start_time).total_seconds() / 3600)

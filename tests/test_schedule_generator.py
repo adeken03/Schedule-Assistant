@@ -236,6 +236,45 @@ class ScheduleGeneratorTests(unittest.TestCase):
         end_times = {shift.end.astimezone().time() for shift in monday_closers}
         self.assertIn(datetime.time(0, 35), end_times)
 
+    def test_budget_trimmed_before_assignment(self) -> None:
+        policy = self._policy(block_names=["Mid"], daily_boost={"Mon": 1})
+        policy["roles"]["Server"]["blocks"]["Mid"].update({"base": 3, "min": 1, "max": 3})
+        policy["roles"]["Server"]["hourly_wage"] = 20
+        policy["global"]["labor_budget_pct"] = 0.1
+        policy["global"]["labor_budget_tolerance_pct"] = 0.0
+        policy["role_groups"] = {
+            "Servers": {"allocation_pct": 1.0, "allow_cuts": True, "cut_buffer_minutes": 30}
+        }
+
+        self._seed_sales({0: 100.0})
+        self._add_employee("Primary", ["Server"], desired_hours=40)
+        self._add_employee("Support1", ["Server"], desired_hours=40)
+        self._add_employee("Support2", ["Server"], desired_hours=40)
+
+        result = self._run_generator(policy)
+
+        monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
+        self.assertEqual(len(monday), 0, msg="Budget trimming should zero out over-budget coverage before assignment")
+        self.assertTrue(result["warnings"] == [] or any("Budget shortfall" in warning for warning in result["warnings"]))
+
+    def test_cut_notes_and_end_times_applied_before_insert(self) -> None:
+        block_windows = {"Mid": ("10:00", "18:00")}
+        policy = self._policy_template(block_windows, ["Server"])
+        policy["roles"]["Server"]["blocks"]["Mid"].update({"base": 2, "min": 1, "max": 2, "cut_buffer_minutes": 90})
+        policy["roles"]["Server"]["hourly_wage"] = 18
+        policy["global"]["labor_budget_pct"] = 1.0
+        policy["global"]["labor_budget_tolerance_pct"] = 0.2
+        self._seed_sales({0: 2000.0})
+        self._add_employee("Long Shift 1", ["Server"], desired_hours=40)
+        self._add_employee("Long Shift 2", ["Server"], desired_hours=40)
+
+        self._run_generator(policy)
+
+        monday = [shift for shift in self._shifts_for_day(0) if shift.role == "Server"]
+        self.assertEqual(len(monday), 2)
+        self.assertTrue(any("cut around" in (shift.notes or "").lower() for shift in monday))
+        self.assertTrue(any(shift.end.time() < datetime.time(18, 0) for shift in monday))
+
     # Helpers -----------------------------------------------------------------
 
     def _run_generator(self, policy: dict) -> dict:
