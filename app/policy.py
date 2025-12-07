@@ -29,6 +29,9 @@ def _normalize_policy(policy: Dict) -> Dict:
     if not isinstance(policy, dict):
         return {}
     normalized = copy.deepcopy(policy)
+    normalized.setdefault("section_priority", "normal")
+    normalized.setdefault("hoh_mode", "auto")
+    normalized.setdefault("allow_mgr_fallback", normalized.get("pre_engine", {}).get("fallback", {}).get("allow_mgr_fallback", True))
     global_defaults = BASELINE_POLICY.get("global", {})
     global_cfg = normalized.setdefault("global", {})
     try:
@@ -1469,6 +1472,9 @@ ANCHOR_RULES: Dict[str, Any] = {
 BASELINE_POLICY: Dict[str, Any] = {
     "name": "Baseline Coverage",
     "description": "Seeded policy that balances FOH/BOH coverage for the automation workflow.",
+    "section_priority": "normal",
+    "hoh_mode": "auto",
+    "allow_mgr_fallback": True,
     "global": {
         "max_hours_week": 48,
         "max_consecutive_days": 7,
@@ -1507,3 +1513,56 @@ def ensure_default_policy(session_factory) -> None:
         name = spec.get("name", "Baseline Coverage")
         params = {key: value for key, value in spec.items() if key != "name"}
         upsert_policy(session, name, params, edited_by="system")
+
+
+def resolve_section_weights(policy: Dict) -> Dict[str, float]:
+    """Return section weights based on priority selection or stored custom values."""
+    priority = (policy.get("section_priority") or "normal").lower()
+    weights = DEFAULT_ENGINE_TUNING["section_weights"].copy()
+    if priority == "patio_light":
+        weights["patio"] = 0.3
+    elif priority == "cocktail_light":
+        weights["cocktail"] = 0.5
+    elif priority == "custom":
+        section_capacity = policy.get("section_capacity", {}).get("Servers", {})
+        weights["dining"] = float(section_capacity.get("Dining", weights["dining"]))
+        weights["patio"] = float(section_capacity.get("Patio", weights["patio"]))
+        weights["cocktail"] = float(section_capacity.get("Cocktail", weights["cocktail"]))
+    return weights
+
+
+def resolve_hoh_thresholds(policy: Dict) -> Dict[str, float]:
+    """Return HOH thresholds based on selected mode."""
+    mode = (policy.get("hoh_mode") or "auto").lower()
+    base = DEFAULT_ENGINE_TUNING["hoh_thresholds"]
+    if mode == "combo":
+        return {"combo_enabled_max": 0.65, "split_threshold": 0.85, "peak_threshold": base["peak_threshold"]}
+    if mode == "split":
+        return {"combo_enabled_max": 0.45, "split_threshold": 0.65, "peak_threshold": base["peak_threshold"]}
+    if mode == "peak":
+        return {"combo_enabled_max": 0.0, "split_threshold": 0.0, "peak_threshold": base["peak_threshold"]}
+    return base.copy()
+
+
+def resolve_fallback_limits(policy: Dict) -> Dict[str, int]:
+    """Return fallback limits derived from allow_mgr_fallback flag."""
+    allow = bool(policy.get("allow_mgr_fallback", True))
+    if not allow:
+        return {"am": 0, "pm": 0}
+    return DEFAULT_ENGINE_TUNING["fallback_limits"].copy()
+DEFAULT_ENGINE_TUNING: Dict[str, Dict[str, float | int]] = {
+    "section_weights": {
+        "dining": 1.0,
+        "patio": 0.5,
+        "cocktail": 0.7,
+    },
+    "hoh_thresholds": {
+        "combo_enabled_max": 0.55,
+        "split_threshold": 0.75,
+        "peak_threshold": 1.00,
+    },
+    "fallback_limits": {
+        "am": 1,
+        "pm": 1,
+    },
+}
