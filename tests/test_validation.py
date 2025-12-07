@@ -103,6 +103,65 @@ class ScheduleValidationTests(unittest.TestCase):
         warnings = [warning for warning in report["warnings"] if warning["type"] == "concurrency"]
         self.assertTrue(any(warning.get("role") == "Server - Dining" for warning in warnings))
 
+    def test_warns_when_employee_exceeds_40_hours(self) -> None:
+        employee = self._add_employee("Full Time Worker", ["Server"])
+        # Add shifts totaling 42 hours across the week
+        shifts_hours = [8, 8, 8, 8, 8, 2]
+        start_day = datetime.datetime(2024, 4, 1, 10, 0, tzinfo=UTC)
+        for day_offset, hours in enumerate(shifts_hours):
+            self._add_shift(
+                role="Server",
+                start=start_day + datetime.timedelta(days=day_offset),
+                end=start_day + datetime.timedelta(days=day_offset, hours=hours),
+                employee=employee,
+            )
+
+        report = validate_week_schedule(self.session, self.week_start, employee_session=self.employee_session)
+
+        hours_warnings = [w for w in report["warnings"] if w["type"] == "weekly_hours"]
+        self.assertEqual(len(hours_warnings), 1)
+        self.assertEqual(hours_warnings[0]["employee_id"], employee.id)
+        self.assertEqual(hours_warnings[0]["hours"], 42.0)
+        self.assertEqual(hours_warnings[0]["limit"], 40)
+
+    def test_no_warning_for_employee_at_40_hours(self) -> None:
+        employee = self._add_employee("Full Time Worker", ["Server"])
+        # Add shifts totaling exactly 40 hours
+        shifts_hours = [8, 8, 8, 8, 8, 0]
+        start_day = datetime.datetime(2024, 4, 1, 10, 0, tzinfo=UTC)
+        for day_offset, hours in enumerate(shifts_hours):
+            if hours > 0:
+                self._add_shift(
+                    role="Server",
+                    start=start_day + datetime.timedelta(days=day_offset),
+                    end=start_day + datetime.timedelta(days=day_offset, hours=hours),
+                    employee=employee,
+                )
+
+        report = validate_week_schedule(self.session, self.week_start, employee_session=self.employee_session)
+
+        hours_warnings = [w for w in report["warnings"] if w["type"] == "weekly_hours"]
+        self.assertEqual(len(hours_warnings), 0)
+
+    def test_no_warning_for_employee_under_40_hours(self) -> None:
+        employee = self._add_employee("Part Time Worker", ["Server"])
+        # Add shifts totaling 30 hours
+        shifts_hours = [6, 6, 6, 6, 6, 0]
+        start_day = datetime.datetime(2024, 4, 1, 10, 0, tzinfo=UTC)
+        for day_offset, hours in enumerate(shifts_hours):
+            if hours > 0:
+                self._add_shift(
+                    role="Server",
+                    start=start_day + datetime.timedelta(days=day_offset),
+                    end=start_day + datetime.timedelta(days=day_offset, hours=hours),
+                    employee=employee,
+                )
+
+        report = validate_week_schedule(self.session, self.week_start, employee_session=self.employee_session)
+
+        hours_warnings = [w for w in report["warnings"] if w["type"] == "weekly_hours"]
+        self.assertEqual(len(hours_warnings), 0)
+
     def _add_employee(self, name: str, roles: list[str]) -> Employee:
         employee = Employee(full_name=name, roles=", ".join(roles), desired_hours=30, status="active", notes="")
         self.employee_session.add(employee)

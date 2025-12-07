@@ -17,6 +17,7 @@ Latest feature work (2025-11-18): warning-gated SM edits in Policy Manager, poli
 - Policy settings UI captures per-day open/mid/close hours and clean role-group allocations, automatically driving AM/PM/Close blocks and labor budgets.
 - Role Wage Manager keeps hourly rates confirmed per role; the scheduler won't run until wages, projected sales, and active employees are all in place.
 - Account Manager and Employee Directory dialogs cover user onboarding and roster maintenance.
+- Backup & Restore system automatically protects data on startup and allows manual backup/restore operations (IT/GM only).
 
 ## Tech stack
 - Python 3.10+
@@ -87,12 +88,24 @@ python -m app.scripts.seed_employees
 ```
 Run it once on a fresh database to get 65+ FOH/BOH records for demos and tests, with balanced coverage for Prep/Chip/Shake and Cashier/To-Go.
 
+## Backup & Restore
+The application includes automatic and manual backup capabilities:
+- **Automatic**: Creates a backup on every startup (keeps 5 most recent)
+- **Manual**: IT/GM users can create, restore, and manage backups via the Backup & Restore dialog
+- **Location**: All backups stored in `app/backups/`
+- See `docs/BACKUP_RESTORE.md` for detailed documentation
+
 ## Development notes & troubleshooting
 - Data lives in `app/data/`. Delete `schedule.db` if you need a fresh environment (dev only).
+- Backups live in `app/backups/`. The app creates automatic backups on startup.
 - `python launch_app.py` reuses the last dependency hash; remove `.venv` if you want a clean reinstall.
 - Smoke test the workflow:
   ```
   python app/scripts/workflow_smoke.py --week-start YYYY-MM-DD   # week arg optional
+  ```
+- Test backup functionality:
+  ```
+  python3 test_backup.py
   ```
 - If UI assets fail to load, confirm the app is running inside the repo root so paths resolve correctly.
 

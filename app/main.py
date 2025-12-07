@@ -112,6 +112,8 @@ from wages import (
 )
 from roles import ROLE_GROUPS, role_group, normalize_role
 from ui.week_view import WeekSchedulePage
+from ui.backup_dialog import BackupManagerDialog
+from backup import auto_backup_on_startup, cleanup_old_auto_backups
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -5836,6 +5838,12 @@ class MainWindow(QMainWindow):
         change_password_button = QPushButton("Change password")
         change_password_button.clicked.connect(self.open_change_password)
         footer_row.addWidget(change_password_button)
+        
+        if self.user["role"] in {"IT", "GM"}:
+            backup_button = QPushButton("Backup/Restore")
+            backup_button.clicked.connect(self.open_backup_manager)
+            footer_row.addWidget(backup_button)
+        
         footer_row.addStretch()
         layout.addLayout(footer_row)
 
@@ -6063,6 +6071,11 @@ class MainWindow(QMainWindow):
         dialog = PolicyDialog(self.session_factory, self.user, read_only=not can_edit)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
+    
+    def open_backup_manager(self) -> None:
+        dialog = BackupManagerDialog(self)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        dialog.exec()
 
     def handle_logout(self) -> None:
         confirm = QMessageBox.question(self, "Sign out", "Return to sign-in screen?")
@@ -6083,6 +6096,13 @@ def launch_app() -> int:
     store = AccountStore(ACCOUNTS_FILE)
     init_database()
     ensure_default_policy(SessionLocal)
+    
+    # Perform automatic backup on startup
+    try:
+        auto_backup_on_startup()
+        cleanup_old_auto_backups(keep_count=5)
+    except Exception:
+        pass  # Silently ignore backup errors to not block app startup
 
     while True:
         login = LoginDialog(store)
