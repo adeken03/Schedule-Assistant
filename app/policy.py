@@ -38,6 +38,12 @@ def _normalize_policy(policy: Dict) -> Dict:
     default_trim = global_defaults.get("trim_aggressive_ratio", 1.0)
     # Ensure trim_aggressive_ratio is at least the code default so budgets are not silently capped.
     global_cfg["trim_aggressive_ratio"] = max(default_trim, trim_ratio)
+    normalized["pre_engine"] = pre_engine_settings(normalized)
+    anchors = normalized.setdefault("anchors", copy.deepcopy(ANCHOR_RULES))
+    non_cuttable = set(anchors.get("non_cuttable_roles", []))
+    for role in required_roles(normalized):
+        non_cuttable.add(role)
+    anchors["non_cuttable_roles"] = sorted(non_cuttable)
     return normalized
 
 
@@ -61,6 +67,43 @@ def anchor_rules(policy: Dict) -> Dict[str, Any]:
     if isinstance(anchors, dict) and anchors:
         return anchors
     return copy.deepcopy(ANCHOR_RULES)
+
+
+def _deep_update(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    merged = copy.deepcopy(base)
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_update(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def pre_engine_settings(policy: Dict) -> Dict[str, Any]:
+    payload = policy.get("pre_engine") if isinstance(policy, dict) else {}
+    if isinstance(payload, dict):
+        merged = _deep_update(PRE_ENGINE_DEFAULTS, payload)
+        if not isinstance(merged.get("budget"), dict):
+            merged["budget"] = copy.deepcopy(PRE_ENGINE_DEFAULTS["budget"])
+        else:
+            budget_cfg = merged["budget"]
+            mode = budget_cfg.get("mode", PRE_ENGINE_DEFAULTS["budget"]["mode"])
+            budget_cfg["mode"] = mode if mode in {"adaptive", "strict"} else PRE_ENGINE_DEFAULTS["budget"]["mode"]
+            try:
+                tolerance_pct = float(budget_cfg.get("tolerance_pct", PRE_ENGINE_DEFAULTS["budget"]["tolerance_pct"]))
+            except (TypeError, ValueError):
+                tolerance_pct = PRE_ENGINE_DEFAULTS["budget"]["tolerance_pct"]
+            if tolerance_pct <= 1:
+                tolerance_pct *= 100
+            budget_cfg["tolerance_pct"] = max(0.0, tolerance_pct)
+        return merged
+    return copy.deepcopy(PRE_ENGINE_DEFAULTS)
+
+
+def required_roles(policy: Dict) -> List[str]:
+    settings = pre_engine_settings(policy)
+    roles = settings.get("required_roles", [])
+    return [role for role in roles if isinstance(role, str) and role.strip()]
 
 
 SHIFT_LENGTH_DEFAULTS: Dict[str, Dict[str, float]] = {
@@ -679,6 +722,54 @@ ROLES: Dict[str, Dict[str, Any]] = {
         group="Servers",
         cut_buffer_minutes=20,
         covers=["Server - Dining", "Server - Cocktail"],
+        enabled=False,
+    ),
+    "Server - Opener": _role_config(
+        wage=6.5,
+        priority=1.02,
+        max_weekly=35,
+        blocks={"Open": _block_config(1, min_staff=1, max_staff=1, start="@open-30", end="@open+240")},
+        group="Servers",
+        allow_cuts=False,
+        cut_buffer_minutes=10,
+        covers=["Server - Dining", "Server - Cocktail"],
+    ),
+    "Server - Dining Preclose": _role_config(
+        wage=6.5,
+        priority=0.97,
+        max_weekly=34,
+        blocks={"PM": _block_config(1, min_staff=1, max_staff=1, start="@close-300", end="@close-45")},
+        group="Servers",
+        allow_cuts=True,
+        cut_buffer_minutes=15,
+        covers=["Server - Dining"],
+    ),
+    "Server - Cocktail Preclose": _role_config(
+        wage=6.7,
+        priority=0.96,
+        max_weekly=34,
+        blocks={"PM": _block_config(1, min_staff=1, max_staff=1, start="@close-300", end="@close-60")},
+        group="Servers",
+        allow_cuts=True,
+        cut_buffer_minutes=15,
+        covers=["Server - Cocktail"],
+    ),
+    "Server - All Roles": _role_config(
+        wage=6.75,
+        priority=0.85,
+        max_weekly=38,
+        blocks={"Mid": _block_config(0, max_staff=0)},
+        group="Servers",
+        allow_cuts=True,
+        enabled=False,
+        covers=[
+            "Server - Dining",
+            "Server - Cocktail",
+            "Server - Dining Preclose",
+            "Server - Cocktail Preclose",
+            "Server - Dining Closer",
+            "Server - Cocktail Closer",
+        ],
     ),
     "Server - Dining Closer": _role_config(
         wage=6.75,
@@ -725,6 +816,20 @@ ROLES: Dict[str, Dict[str, Any]] = {
         always_on=True,
         cut_buffer_minutes=0,
     ),
+    "Bartender - Opener": _role_config(
+        wage=10.5,
+        priority=1.0,
+        max_weekly=40,
+        blocks={
+            "Open": _block_config(1, min_staff=1, max_staff=1, start="@open-30", end="@open+240"),
+            "Mid": _block_config(0, min_staff=0, max_staff=1),
+        },
+        group="Bartenders",
+        allow_cuts=False,
+        always_on=True,
+        cut_buffer_minutes=0,
+        covers=["Bartender"],
+    ),
     "Bartender - Closer": _role_config(
         wage=11.0,
         priority=1.05,
@@ -747,6 +852,7 @@ ROLES: Dict[str, Dict[str, Any]] = {
         group="Bartenders",
         cut_buffer_minutes=15,
         covers=["Bartender"],
+        enabled=False,
     ),
     "Cashier": _role_config(
         wage=15.0,
@@ -775,6 +881,46 @@ ROLES: Dict[str, Dict[str, Any]] = {
         group="Cashier",
         cut_buffer_minutes=20,
         covers=["Cashier - To-Go Specialist", "Host"],
+    ),
+    "Cashier - To-Go": _role_config(
+        wage=15.0,
+        priority=0.9,
+        max_weekly=35,
+        daily_boost={"Sun": -2},
+        blocks={
+            "Mid": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.1,
+                floor_by_demand=[{"gte": 0.5, "min": 1}],
+            ),
+            "PM": _block_config(
+                1,
+                min_staff=1,
+                max_staff=2,
+                per_sales=0.15,
+                floor_by_demand=[{"gte": 0.5, "min": 1}],
+            ),
+            "Close": _block_config(0, min_staff=0, max_staff=0, per_sales=0.0),
+        },
+        group="Cashier",
+        cut_buffer_minutes=25,
+        covers=["Cashier", "Cashier - Host"],
+    ),
+    "Cashier - Host": _role_config(
+        wage=14.0,
+        priority=0.82,
+        max_weekly=32,
+        daily_boost={"Sun": -2},
+        thresholds=[],
+        blocks={
+            "Open": _block_config(0, min_staff=0, max_staff=1, per_sales=0.01),
+            "Mid": _block_config(0, min_staff=0, max_staff=1, per_sales=0.05),
+        },
+        group="Cashier",
+        cut_buffer_minutes=25,
+        covers=["Cashier", "Cashier - To-Go"],
     ),
     "Cashier - To-Go Specialist": _role_config(
         wage=15.0,
@@ -814,6 +960,17 @@ ROLES: Dict[str, Dict[str, Any]] = {
         group="Cashier",
         cut_buffer_minutes=15,
         covers=["Cashier", "Cashier - To-Go Specialist"],
+        enabled=False,
+    ),
+    "Cashier - All Roles": _role_config(
+        wage=14.5,
+        priority=0.8,
+        max_weekly=38,
+        blocks={"Mid": _block_config(0, max_staff=0)},
+        group="Cashier",
+        allow_cuts=True,
+        enabled=False,
+        covers=["Cashier", "Cashier - To-Go", "Cashier - Host"],
     ),
     "Host": _role_config(
         wage=14.0,
@@ -1004,6 +1161,160 @@ ROLES: Dict[str, Dict[str, Any]] = {
         cut_buffer_minutes=20,
         covers=["Expo", "Grill", "Chip", "Shake"],
     ),
+    "HOH - Expo": _role_config(
+        wage=17.5,
+        priority=0.95,
+        max_weekly=40,
+        thresholds=[{"metric": "demand_index", "gte": 0.8, "add": 1}],
+        blocks={
+            "Open": _block_config(1, max_staff=1, start="@open-15", end="@open+180"),
+            "Mid": _block_config(1, max_staff=1),
+            "PM": _block_config(1, max_staff=1),
+            "Close": _block_config(0, max_staff=0),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["HOH - Chip", "HOH - Shake"],
+        critical=True,
+        allow_cuts=False,
+    ),
+    "HOH - Southwest & Grill": _role_config(
+        wage=18.5,
+        priority=0.9,
+        max_weekly=40,
+        blocks={
+            "Mid": _block_config(1, min_staff=0, max_staff=2, per_sales=0.08),
+            "PM": _block_config(1, min_staff=0, max_staff=2, per_sales=0.12),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=30,
+        covers=["HOH - Grill", "HOH - Southwest"],
+    ),
+    "HOH - Grill": _role_config(
+        wage=18.0,
+        priority=0.94,
+        max_weekly=40,
+        blocks={
+            "Mid": _block_config(0, min_staff=0, max_staff=2, per_sales=0.06),
+            "PM": _block_config(0, min_staff=0, max_staff=2, per_sales=0.1),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=30,
+        covers=["HOH - Southwest"],
+    ),
+    "HOH - Southwest": _role_config(
+        wage=17.0,
+        priority=0.9,
+        max_weekly=40,
+        blocks={
+            "Mid": _block_config(0, min_staff=0, max_staff=2, per_sales=0.06),
+            "PM": _block_config(0, min_staff=0, max_staff=2, per_sales=0.1),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=30,
+        covers=["HOH - Grill"],
+    ),
+    "HOH - Chip & Shake": _role_config(
+        wage=15.5,
+        priority=0.8,
+        max_weekly=34,
+        blocks={
+            "Mid": _block_config(0, min_staff=0, max_staff=2, per_sales=0.05),
+            "PM": _block_config(0, min_staff=0, max_staff=2, per_sales=0.08),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["HOH - Chip", "HOH - Shake"],
+    ),
+    "HOH - Chip": _role_config(
+        wage=15.5,
+        priority=0.78,
+        max_weekly=34,
+        blocks={
+            "Mid": _block_config(0, max_staff=2, per_sales=0.04),
+            "PM": _block_config(0, max_staff=2, per_sales=0.06),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["HOH - Shake"],
+    ),
+    "HOH - Shake": _role_config(
+        wage=15.5,
+        priority=0.78,
+        max_weekly=34,
+        blocks={
+            "Mid": _block_config(0, max_staff=2, per_sales=0.04),
+            "PM": _block_config(0, max_staff=2, per_sales=0.06),
+        },
+        group="Kitchen",
+        cut_buffer_minutes=25,
+        covers=["HOH - Chip"],
+    ),
+    "HOH - Opener": _role_config(
+        wage=18.5,
+        priority=0.88,
+        max_weekly=38,
+        blocks={"Open": _block_config(1, max_staff=1, start="@open-30", end="@open+240")},
+        group="Kitchen",
+        cut_buffer_minutes=20,
+        covers=["HOH - Chip", "HOH - Shake"],
+    ),
+    "HOH - Closer": _role_config(
+        wage=19.0,
+        priority=0.9,
+        max_weekly=38,
+        blocks={"Close": _block_config(1, max_staff=1, start="@close-300", end="@close+60")},
+        group="Kitchen",
+        allow_cuts=False,
+        cut_buffer_minutes=0,
+        covers=["HOH - Chip", "HOH - Shake"],
+    ),
+    "HOH - Training": _role_config(
+        wage=17.0,
+        priority=0.5,
+        max_weekly=28,
+        blocks={"Mid": _block_config(0, max_staff=1), "PM": _block_config(0, max_staff=1)},
+        group="Kitchen",
+        cut_buffer_minutes=20,
+        covers=["HOH - Expo", "HOH - Grill", "HOH - Chip", "HOH - Shake"],
+        enabled=False,
+    ),
+    "HOH - All Roles": _role_config(
+        wage=18.0,
+        priority=0.85,
+        max_weekly=40,
+        blocks={"Mid": _block_config(0, max_staff=0)},
+        group="Kitchen",
+        allow_cuts=True,
+        enabled=False,
+        covers=[
+            "HOH - Expo",
+            "HOH - Grill",
+            "HOH - Southwest",
+            "HOH - Chip",
+            "HOH - Shake",
+            "HOH - Southwest & Grill",
+            "HOH - Chip & Shake",
+        ],
+    ),
+    "MGR - FOH": _role_config(
+        wage=0.0,
+        priority=0.6,
+        max_weekly=50,
+        blocks={"Mid": _block_config(0, max_staff=0)},
+        group="Management",
+        allow_cuts=True,
+        enabled=False,
+    ),
+    "Shift Lead": _role_config(
+        wage=22.0,
+        priority=1.1,
+        max_weekly=45,
+        blocks={"Mid": _block_config(0, max_staff=0)},
+        group="Management",
+        allow_cuts=True,
+        enabled=False,
+    ),
 }
 
 
@@ -1013,6 +1324,71 @@ ROLE_GROUP_ALLOCATIONS: Dict[str, Dict[str, Any]] = {
     "Bartenders": {"allocation_pct": 0.12, "allow_cuts": False, "always_on": True, "cut_buffer_minutes": 0},
     "Cashier": {"allocation_pct": 0.15, "allow_cuts": True, "cut_buffer_minutes": 25},
     "Management": {"allocation_pct": 0.0, "allow_cuts": True, "cut_buffer_minutes": 30},
+}
+
+VOLUME_THRESHOLDS_DEFAULT: Dict[str, float] = {"slow_max": 0.45, "moderate_max": 0.75, "peak_min": 0.9}
+PRE_ENGINE_DEFAULTS: Dict[str, Any] = {
+    "required_roles": [
+        "Bartender - Opener",
+        "Bartender - Closer",
+        "HOH - Opener",
+        "HOH - Closer",
+        "HOH - Expo",
+        "Server - Opener",
+        "Server - Dining Preclose",
+        "Server - Dining Closer",
+        "Server - Cocktail Preclose",
+        "Server - Cocktail Closer",
+        "Cashier",
+    ],
+    "fallback": {
+        "allow_mgr_fallback": True,
+        "am_limit": 1,
+        "pm_limit": 1,
+        "tag": "MANAGER COVERING — REVIEW REQUIRED",
+        "disallow_roles": ["bartender", "server", "expo", "opener", "closer"],
+    },
+    "staffing": {
+        "volume_thresholds": VOLUME_THRESHOLDS_DEFAULT,
+        "servers": {
+            "dining": {"slow_min": 1, "slow_max": 4, "moderate": 5, "peak": 6, "manual_max": 7},
+            "cocktail": {"normal": 2, "busy": 3, "peak": 4, "manual_max": 4},
+            "opener_count": 1,
+            "preclose": {"dining": 1, "cocktail": 1},
+            "closers": {"dining": 1, "cocktail": 1},
+            "cut_order": {
+                "dining": ["Server - Dining", "Server - Dining Preclose", "Server - Dining Closer"],
+                "cocktail": ["Server - Cocktail", "Server - Cocktail Preclose", "Server - Cocktail Closer"],
+                "fifo": True,
+            },
+        },
+        "cashier": {
+            "am_default": 1,
+            "pm_default": 1,
+            "busy_split": 2,
+            "peak": 3,
+            "manual_max": 4,
+            "coverable_by": ["Servers", "Bartenders", "MGR - FOH"],
+            "cut_after_minutes": 90,
+        },
+        "hoh": {
+            "combo_thresholds": {"low_max": 0.55, "split_min": 0.75, "peak_min": 1.0},
+            "open_sequence": {"southwest": "11:00", "chip": "11:15", "expo": "@open"},
+            "combo_roles": {"sw_grill": "HOH - Southwest & Grill", "chip_shake": "HOH - Chip & Shake"},
+            "cut_priority": [
+                "HOH - Southwest",
+                "HOH - Chip",
+                "HOH - Shake",
+                "HOH - Grill",
+                "HOH - Chip & Shake",
+                "HOH - Southwest & Grill",
+                "HOH - Expo",
+            ],
+            "non_combinable": ["HOH - Expo"],
+        },
+    },
+    "training": {"auto_generate": False, "preserve_manual": True},
+    "budget": {"mode": "adaptive", "tolerance_pct": 8.0},
 }
 
 CUT_PRIORITY_DEFAULT: Dict[str, Any] = {
@@ -1063,29 +1439,30 @@ ANCHOR_RULES: Dict[str, Any] = {
     "openers": {"Kitchen": 1, "Servers": 1, "Bartenders": 1, "Cashier": 0},
     "closers": {"Kitchen": 1, "Servers": 2, "Bartenders": 1, "Cashier": 0},
     "opener_roles": {
-        "Kitchen": ["Kitchen Opener"],
-        "Servers": ["Server - Dining Opener", "Server - Cocktail Opener", "Server - Dining", "Server - Cocktail"],
+        "Kitchen": ["HOH - Opener"],
+        "Servers": ["Server - Opener", "Server - Dining", "Server - Cocktail"],
         "Bartenders": ["Bartender - Opener", "Bartender"],
-        "Cashier": ["Cashier", "Cashier - To-Go Specialist"],
+        "Cashier": ["Cashier", "Cashier - To-Go", "Cashier - Host"],
     },
     "closer_roles": {
-        "Kitchen": ["Kitchen Closer"],
+        "Kitchen": ["HOH - Closer"],
         "Servers": ["Server - Dining Closer", "Server - Cocktail Closer", "Server - Dining", "Server - Cocktail"],
         "Bartenders": ["Bartender - Closer", "Bartender"],
-        "Cashier": ["Cashier - To-Go Specialist", "Cashier"],
+        "Cashier": ["Cashier - To-Go", "Cashier - Host", "Cashier"],
     },
     "non_cuttable_roles": [
-        "Bartender",
+        "Bartender - Opener",
         "Bartender - Closer",
-        "Kitchen Closer",
+        "HOH - Expo",
+        "HOH - Closer",
         "Server - Dining Closer",
         "Server - Cocktail Closer",
     ],
     "allow_cashier_closer": False,
-    # Controls FIFO/LILO bias for open/close patterns: "off", "prefer", "enforce".
-    "open_close_order": "prefer",
-    # Optional cut rotation + role ordering configuration.
-    "cut_priority": CUT_PRIORITY_DEFAULT,
+    # Controls FIFO/LILO bias for open/close patterns: static enforcement.
+    "open_close_order": "enforce",
+    # Cut rotation configurable via UI removed; ordering handled in code.
+    "cut_priority": {},
 }
 
 
@@ -1095,12 +1472,9 @@ BASELINE_POLICY: Dict[str, Any] = {
     "global": {
         "max_hours_week": 48,
         "max_consecutive_days": 7,
-        "round_to_minutes": 15,
-        "allow_split_shifts": True,
         "overtime_penalty": 1.5,
         "desired_hours_floor_pct": 0.85,
         "desired_hours_ceiling_pct": 1.15,
-        "open_buffer_minutes": 30,
         "close_buffer_minutes": 35,
         "labor_budget_pct": 0.27,
         "labor_budget_tolerance_pct": 0.08,
@@ -1109,12 +1483,12 @@ BASELINE_POLICY: Dict[str, Any] = {
     "timeblocks": DEFAULT_TIMEBLOCKS,
     "business_hours": BUSINESS_HOURS,
     "anchors": ANCHOR_RULES,
-    "role_groups": ROLE_GROUP_ALLOCATIONS,
     "pattern_templates": PATTERN_TEMPLATES,
     "seasonal_settings": SEASONAL_SETTINGS_DEFAULT,
     "shift_presets": SHIFT_PRESET_DEFAULTS,
     "section_capacity": SECTION_CAPACITY_DEFAULTS,
     "roles": ROLES,
+    "pre_engine": PRE_ENGINE_DEFAULTS,
 }
 
 

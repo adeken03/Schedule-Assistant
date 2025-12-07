@@ -9,12 +9,12 @@ ROLE_GROUPS: Dict[str, List[str]] = {
         "HOH - Closer",
         "HOH - Training",
         "HOH - Expo",
+        "HOH - Southwest & Grill",
         "HOH - Grill",
         "HOH - Southwest",
+        "HOH - Chip & Shake",
         "HOH - Chip",
         "HOH - Shake",
-        "HOH - Prep",
-        "HOH - Cook",
         "HOH - All Roles",  # simply means all other roles can be fulfilled/considered for this employee
     ],
     "Servers": [
@@ -72,6 +72,7 @@ _KEYWORD_RULES: List[Tuple[str, str]] = [
     ("chip", "Kitchen"),
     ("shake", "Kitchen"),
     ("hoh", "Kitchen"),
+    ("southwest", "Kitchen"),
     ("lead", "Management"),
     ("mgr", "Management"),
 ]

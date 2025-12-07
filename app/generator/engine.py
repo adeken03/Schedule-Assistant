@@ -37,6 +37,9 @@ from policy import (
     parse_time_label,
     shift_length_limits,
     shift_length_rule,
+    pre_engine_settings,
+    required_roles,
+    ROLE_GROUP_ALLOCATIONS,
 )
 from roles import is_manager_role, normalize_role, role_matches, role_group
 
@@ -129,15 +132,17 @@ class ScheduleGenerator:
         global_cfg = self.policy.get("global") or {}
         self.max_hours_per_week: float = float(global_cfg.get("max_hours_week", 40) or 40)
         self.max_consecutive_days: int = int(global_cfg.get("max_consecutive_days", 6) or 6)
-        self.round_to_minutes: int = int(global_cfg.get("round_to_minutes", 15) or 15)
-        self.allow_split_shifts: bool = bool(global_cfg.get("allow_split_shifts", True))
+        # Shift snapping fixed at 15-minute increments.
+        self.round_to_minutes: int = 15
+        self.allow_split_shifts: bool = True
         self.overtime_penalty: float = float(global_cfg.get("overtime_penalty", 1.5) or 1.5)
         desired_floor = float(global_cfg.get("desired_hours_floor_pct", 0.85) or 0.0)
         desired_ceiling = float(global_cfg.get("desired_hours_ceiling_pct", 1.15) or 0.0)
         self.desired_hours_floor_pct: float = self._clamp(desired_floor, 0.0, 1.0)
         min_ceiling = max(self.desired_hours_floor_pct + 0.05, 0.1)
         self.desired_hours_ceiling_pct: float = self._clamp(max(desired_ceiling, min_ceiling), min_ceiling, 2.0)
-        self.open_buffer_minutes: int = int(global_cfg.get("open_buffer_minutes", 30) or 0)
+        # Open buffer is fixed at 30 minutes (10:30-11:00 window).
+        self.open_buffer_minutes: int = 30
         self.close_buffer_minutes: int = int(global_cfg.get("close_buffer_minutes", 35) or 0)
         labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
         if labor_pct > 1.0:
@@ -148,6 +153,22 @@ class ScheduleGenerator:
             labor_tol /= 100.0
         self.labor_budget_tolerance = self._clamp(labor_tol, 0.0, 0.5)
         self.budget_target_ratio = max(0.75, 1.0 - (self.labor_budget_tolerance / 2.0))
+        self.pre_engine = pre_engine_settings(self.policy)
+        self.pre_engine_staffing = self.pre_engine.get("staffing", {})
+        self.required_role_labels: Set[str] = set(required_roles(self.policy))
+        fallback_cfg = self.pre_engine.get("fallback", {})
+        self.manager_fallback_allowed = bool(fallback_cfg.get("allow_mgr_fallback", False))
+        self.manager_fallback_limits = {
+            "am": int(fallback_cfg.get("am_limit", 1) or 0),
+            "pm": int(fallback_cfg.get("pm_limit", 1) or 0),
+        }
+        self.manager_fallback_tag = fallback_cfg.get("tag", "MANAGER COVERING — REVIEW REQUIRED")
+        self.manager_fallback_disallow = [str(entry).lower() for entry in fallback_cfg.get("disallow_roles", [])]
+        self.manager_fallback_counts: Dict[int, Dict[str, int]] = {idx: {"am": 0, "pm": 0} for idx in range(7)}
+        hoh_cfg = self.pre_engine_staffing.get("hoh", {})
+        self.non_combinable_roles: Set[str] = {normalize_role(role) for role in hoh_cfg.get("non_combinable", [])}
+        self.volume_thresholds = self.pre_engine_staffing.get("volume_thresholds", {})
+        self.errors: List[str] = []
 
         self.employees: List[Dict[str, Any]] = []
         self.modifiers_by_day: Dict[int, List[Dict[str, Any]]] = {}
@@ -240,6 +261,8 @@ class ScheduleGenerator:
         self._retry_unfilled_assignments(assignments)
         self._enforce_shift_continuity(assignments, week.week_start_date)
         self._warn_unpaired_openers()
+        self._check_section_thresholds(assignments)
+        self._record_required_role_gaps(assignments)
 
         created_ids: List[int] = []
         for payload in assignments:
@@ -248,6 +271,7 @@ class ScheduleGenerator:
 
         summary = self._build_summary(week, assignments)
         summary["warnings"].extend(self.warnings)
+        summary["errors"] = list(self.errors)
         summary["shifts_created"] = len(created_ids)
         record_audit_log(
             self.session,
@@ -264,6 +288,8 @@ class ScheduleGenerator:
         week.status = "draft"
         self.session.commit()
         self.unfilled_slots = []
+        self.errors = []
+        self.manager_fallback_counts = {idx: {"am": 0, "pm": 0} for idx in range(7)}
 
     def _load_employee_profiles(self) -> List[Dict[str, Any]]:
         stmt = (
@@ -339,20 +365,19 @@ class ScheduleGenerator:
         specs = self.policy.get("role_groups") if isinstance(self.policy, dict) else {}
         mapping: Dict[str, Dict[str, Any]] = {}
         if not isinstance(specs, dict):
-            return mapping
+            specs = {}
         for name, raw in specs.items():
             if not isinstance(raw, dict):
                 continue
-            label = (name or "Group").strip() or "Group"
             allocation = self._parse_allocation_pct(raw.get("allocation_pct"))
-            mapping[label] = {
+            mapping[name] = {
                 "allocation_pct": allocation,
                 "allow_cuts": bool(raw.get("allow_cuts", True)),
                 "always_on": bool(raw.get("always_on", False)),
                 "cut_buffer_minutes": int(raw.get("cut_buffer_minutes", 30) or 0),
             }
         if not mapping:
-            mapping = build_default_policy().get("role_groups", {})
+            mapping = copy.deepcopy(ROLE_GROUP_ALLOCATIONS)
         return mapping
 
     def _load_cut_priority_settings(self) -> Dict[str, Any]:
@@ -466,6 +491,7 @@ class ScheduleGenerator:
                 {
                     "day_index": day_index,
                     "weekday_token": WEEKDAY_TOKENS[day_index],
+                    "date": week_start + datetime.timedelta(days=day_index),
                     "sales": sales,
                     "notes": notes_payload,
                     "modifier_multiplier": modifier_multiplier,
@@ -1915,7 +1941,92 @@ class ScheduleGenerator:
                 payload.get("close"),
             )
         role_plans = self._map_plans_to_roles(shift_plans, roles_by_group)
+        role_plans = self._inject_required_role_plans(role_plans, demands)
         return self._assign_employees(role_plans)
+
+    def _inject_required_role_plans(
+        self, plans: List[Dict[str, Any]], demands: Dict[Tuple[int, str], Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Ensure required roles appear on every day even before employee assignment."""
+        if not self.required_role_labels:
+            return plans
+        existing = {(plan.get("day_index"), normalize_role(plan.get("role", ""))) for plan in plans}
+        augmented = list(plans)
+        for day_index in range(7):
+            for role_label in self.required_role_labels:
+                normalized = normalize_role(role_label)
+                if (day_index, normalized) in existing:
+                    continue
+                start_dt, end_dt, slot_indices, role_group_name = self._required_window_for_day(
+                    day_index, role_label, demands
+                )
+                if not start_dt or not end_dt or start_dt >= end_dt:
+                    self.errors.append(f"Unable to place required role {role_label} on day index {day_index}.")
+                    continue
+                augmented.append(
+                    {
+                        "day_index": day_index,
+                        "date": start_dt.date(),
+                        "role_group": role_group_name,
+                        "role": role_label,
+                        "style": "Required",
+                        "start": start_dt,
+                        "end": end_dt,
+                        "template_start": start_dt,
+                        "slot_indices": slot_indices,
+                        "essential": True,
+                        "_required": True,
+                    }
+                )
+                existing.add((day_index, normalized))
+        return augmented
+
+    def _required_window_for_day(
+        self, day_index: int, role_label: str, demands: Dict[Tuple[int, str], Dict[str, Any]]
+    ) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime], List[int], str]:
+        group_name = self._canonical_group(role_group(role_label))
+        payload = demands.get((day_index, group_name), {})
+        slots = payload.get("slots", [])
+        open_dt = payload.get("open")
+        close_dt = payload.get("close")
+        ctx_date = None
+        if not open_dt or not close_dt:
+            if 0 <= day_index < len(self.day_contexts):
+                ctx_date = self.day_contexts[day_index].get("date")
+            if ctx_date:
+                day_start = datetime.datetime.combine(ctx_date, datetime.time.min, tzinfo=UTC)
+                open_dt = day_start + datetime.timedelta(minutes=open_minutes(self.policy, ctx_date))
+                close_dt = day_start + datetime.timedelta(minutes=close_minutes(self.policy, ctx_date))
+        start_dt, end_dt = self._window_for_required_role(role_label, open_dt, close_dt)
+        slot_indices = self._slot_indices_for_range(slots, start_dt, end_dt) if slots else []
+        return start_dt, end_dt, slot_indices, group_name
+
+    def _window_for_required_role(
+        self, role_label: str, open_dt: Optional[datetime.datetime], close_dt: Optional[datetime.datetime]
+    ) -> Tuple[Optional[datetime.datetime], Optional[datetime.datetime]]:
+        if not open_dt or not close_dt:
+            return None, None
+        role_lower = normalize_role(role_label)
+        opener = "opener" in role_lower
+        closer = "closer" in role_lower
+        buffer_open = datetime.timedelta(minutes=max(0, self.open_buffer_minutes))
+        buffer_close = datetime.timedelta(minutes=max(0, self.close_buffer_minutes))
+        if opener:
+            start_dt = open_dt - buffer_open
+            end_dt = min(close_dt, start_dt + datetime.timedelta(hours=5))
+        elif closer:
+            end_dt = close_dt + buffer_close
+            start_dt = max(open_dt, end_dt - datetime.timedelta(hours=5))
+        elif "preclose" in role_lower:
+            end_dt = close_dt + buffer_close
+            start_dt = max(open_dt, end_dt - datetime.timedelta(hours=3))
+        elif "expo" in role_lower:
+            start_dt = open_dt - datetime.timedelta(minutes=15)
+            end_dt = close_dt
+        else:
+            start_dt = open_dt
+            end_dt = close_dt
+        return self._snap_datetime(start_dt), self._snap_datetime(end_dt)
 
     def _plan_coverage(self, plans: List[Dict[str, Any]], slots: List[Dict[str, Any]], group_name: str) -> List[int]:
         coverage = [0 for _ in slots]
@@ -2190,13 +2301,47 @@ class ScheduleGenerator:
 
     def _role_for_kitchen_plan(self, idx: int, roles: List[str], plan: Dict[str, Any]) -> Tuple[str, bool]:
         expo_roles = [r for r in roles if "expo" in r.lower() or "expeditor" in r.lower()]
-        grill_roles = [r for r in roles if "grill" in r.lower()]
-        if expo_roles:
-            if idx == 0 or plan.get("style") in {"Open", "Prep"}:
-                return expo_roles[0], True
-        if grill_roles:
-            return grill_roles[0], False
-        return (roles[0] if roles else plan.get("role") or "Kitchen"), False
+        day_index = plan.get("day_index", 0)
+        demand_index = 1.0
+        if 0 <= day_index < len(self.day_contexts):
+            demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
+        hoh_cfg = self.pre_engine_staffing.get("hoh", {})
+        thresholds = hoh_cfg.get("combo_thresholds", {})
+        low_max = float(thresholds.get("low_max", 0.55) or 0.55)
+        split_min = float(thresholds.get("split_min", 0.75) or 0.75)
+        peak_min = float(thresholds.get("peak_min", 1.0) or 1.0)
+        if demand_index <= low_max:
+            stage = "low"
+        elif demand_index >= peak_min:
+            stage = "peak"
+        else:
+            stage = "moderate"
+        combo_roles = hoh_cfg.get("combo_roles", {})
+        stage_order = {
+            "low": [
+                "HOH - Expo",
+                combo_roles.get("sw_grill", "HOH - Southwest & Grill"),
+                combo_roles.get("chip_shake", "HOH - Chip & Shake"),
+                "HOH - Grill",
+                "HOH - Southwest",
+            ],
+            "moderate": [
+                "HOH - Expo",
+                "HOH - Grill",
+                "HOH - Southwest",
+                combo_roles.get("chip_shake", "HOH - Chip & Shake"),
+                "HOH - Shake",
+            ],
+            "peak": ["HOH - Expo", "HOH - Grill", "HOH - Southwest", "HOH - Chip", "HOH - Shake"],
+        }
+        ordered_roles = stage_order.get(stage, stage_order["moderate"])
+        available = [role for role in ordered_roles if role in roles]
+        if idx < len(available):
+            role_choice = available[idx]
+        else:
+            role_choice = roles[idx % len(roles)] if roles else plan.get("role") or "Kitchen"
+        is_expo = "expo" in role_choice.lower()
+        return role_choice, is_expo
 
     def _role_for_group_default(self, group_name: str, roles: List[str]) -> str:
         if roles:
@@ -2332,12 +2477,15 @@ class ScheduleGenerator:
     def _cut_sort_key_simple(self, shift: Dict[str, Any]) -> Tuple[Any, ...]:
         style = shift.get("_style", "Mid")
         role_label = (shift.get("role") or "").lower()
-        if "cocktail" in role_label:
+        group_label = shift.get("_role_group") or self._canonical_group(role_group(shift.get("role")))
+        if group_label == "Kitchen":
+            hoh_order = [normalize_role(name) for name in self.pre_engine_staffing.get("hoh", {}).get("cut_priority", [])]
+            role_norm = normalize_role(shift.get("role"))
+            role_rank = hoh_order.index(role_norm) if role_norm in hoh_order else len(hoh_order) + 1
+        elif "cocktail" in role_label:
             role_rank = 0
         elif "server" in role_label:
             role_rank = 1
-        elif "kitchen" in role_label or "expo" in role_label or "grill" in role_label:
-            role_rank = 2
         elif "bartender" in role_label:
             role_rank = 3
         else:
@@ -2454,6 +2602,8 @@ class ScheduleGenerator:
                 continue
             candidate = self._find_emergency_candidate(demand)
             if not candidate:
+                if self._attempt_manager_fallback(demand, payload):
+                    continue
                 remaining.append(slot)
                 continue
             self._apply_recovery_assignment(candidate, demand, payload)
@@ -2481,6 +2631,32 @@ class ScheduleGenerator:
                 continue
             return employee
         return None
+
+    def _attempt_manager_fallback(self, demand: BlockDemand, payload: Dict[str, Any]) -> bool:
+        """Reserve manager fallback for last-resort coverage with strict limits."""
+        if not self.manager_fallback_allowed:
+            return False
+        role_norm = normalize_role(demand.role)
+        if any(token in role_norm for token in self.manager_fallback_disallow):
+            return False
+        if "bartender" in role_norm or "expo" in role_norm or "opener" in role_norm or "closer" in role_norm:
+            return False
+        period = "am" if demand.start.hour < 15 else "pm"
+        if self.manager_fallback_counts.get(demand.day_index, {}).get(period, 0) >= self.manager_fallback_limits.get(
+            period, 0
+        ):
+            return False
+        self.manager_fallback_counts[demand.day_index][period] += 1
+        payload["employee_id"] = None
+        payload["labor_rate"] = 0.0
+        payload["labor_cost"] = 0.0
+        payload["notes"] = self._append_note(payload.get("notes"), self.manager_fallback_tag)
+        payload["_manager_fallback"] = True
+        self.warnings.append(
+            f"MGR–FOH fallback assigned to {demand.role} on {demand.date.isoformat()} "
+            f"{demand.start.strftime('%H:%M')}–{demand.end.strftime('%H:%M')} (period {period.upper()})."
+        )
+        return True
 
     def _apply_recovery_assignment(
         self,
@@ -2780,14 +2956,33 @@ class ScheduleGenerator:
         if not role_name:
             return False
         candidate_roles = employee.get("roles") or set()
+        target_group = role_group(role_name)
+        disallowed_groups = {"Kitchen"} if target_group == "Cashier" else set()
         for candidate in candidate_roles:
+            candidate_group = role_group(candidate)
+            if candidate_group in disallowed_groups:
+                continue
+            if candidate_group == "Management" and target_group in {"Servers", "Bartenders"}:
+                continue
+            if target_group == "Kitchen" and candidate_group not in {"Kitchen"}:
+                # Allow explicit cross-train only if the employee has the exact role.
+                if not role_matches(candidate, role_name):
+                    continue
+            if target_group in {"Servers", "Bartenders"} and candidate_group == "Kitchen":
+                if not role_matches(candidate, role_name):
+                    continue
             if role_matches(candidate, role_name):
                 return True
             candidate_cfg = role_definition(self.policy, candidate)
             covers = candidate_cfg.get("covers") if isinstance(candidate_cfg, dict) else []
             if covers and role_name in covers:
                 return True
-        target_group = role_group(role_name)
+        if target_group == "Cashier":
+            # Cashier can be covered by Servers/Bartenders/Managers when explicitly assigned.
+            for candidate in candidate_roles:
+                candidate_group = role_group(candidate)
+                if candidate_group in {"Servers", "Bartenders", "Management"}:
+                    return True
         if target_group and target_group in self.interchangeable_groups:
             for candidate in candidate_roles:
                 if role_group(candidate) == target_group:
@@ -3323,6 +3518,96 @@ class ScheduleGenerator:
                         f"Opener continuity missing for {employee['name']} on {self._day_label(day_index)}; add a follow-up shift."
                     )
                 links.clear()
+
+    def _check_section_thresholds(self, assignments: List[Dict[str, Any]]) -> None:
+        server_cfg = self.pre_engine_staffing.get("servers", {})
+        dining_cfg = server_cfg.get("dining", {})
+        cocktail_cfg = server_cfg.get("cocktail", {})
+        cashier_cfg = self.pre_engine_staffing.get("cashier", {})
+        for day_index in range(7):
+            demand_index = 1.0
+            ctx_date = None
+            if 0 <= day_index < len(self.day_contexts):
+                demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
+                ctx_date = self.day_contexts[day_index].get("date")
+            tier = self._volume_tier(demand_index)
+            dining_count = self._count_roles_for_day(
+                assignments, day_index, lambda name: "server" in name and "cocktail" not in name and "patio" not in name
+            )
+            cocktail_count = self._count_roles_for_day(assignments, day_index, lambda name: "cocktail" in name)
+            cashier_count = self._count_roles_for_day(assignments, day_index, lambda name: "cashier" in name or "host" in name)
+            if tier == "slow" and dining_count > int(dining_cfg.get("slow_max", 4)):
+                self.warnings.append(
+                    f"Dining staffing {dining_count} exceeds slow cap ({dining_cfg.get('slow_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                )
+            if tier in {"moderate", "peak"} and dining_count < int(dining_cfg.get("slow_min", 1)):
+                self.errors.append(f"Dining staffing below minimum on {ctx_date or self._day_label(day_index)}.")
+            manual_dining = int(dining_cfg.get("manual_max", 7))
+            if manual_dining and dining_count > manual_dining:
+                self.warnings.append(
+                    f"Dining staffing {dining_count} exceeds manual override threshold ({manual_dining}) on {ctx_date or self._day_label(day_index)}."
+                )
+            if tier == "peak" and dining_count < int(dining_cfg.get("peak", 6)):
+                self.warnings.append(
+                    f"Dining staffing below peak target ({dining_cfg.get('peak', 6)}) on {ctx_date or self._day_label(day_index)}."
+                )
+            if tier == "peak" and cocktail_count > int(cocktail_cfg.get("manual_max", 4)):
+                self.warnings.append(
+                    f"Cocktail staffing {cocktail_count} requires manual override (>{cocktail_cfg.get('manual_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                )
+            if tier == "slow" and cocktail_count < int(cocktail_cfg.get("normal", 2)):
+                self.errors.append(f"Cocktail staffing below normal ({cocktail_cfg.get('normal', 2)}) on {ctx_date or self._day_label(day_index)}.")
+            if cashier_count > int(cashier_cfg.get("manual_max", 4)):
+                self.warnings.append(
+                    f"Cashier staffing {cashier_count} exceeds manual override threshold ({cashier_cfg.get('manual_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                )
+            if cashier_count < int(cashier_cfg.get("am_default", 1)):
+                self.errors.append(f"Cashier coverage missing on {ctx_date or self._day_label(day_index)}.")
+
+    def _record_required_role_gaps(self, assignments: List[Dict[str, Any]]) -> None:
+        if not self.required_role_labels:
+            return
+        for day_index in range(7):
+            for role_label in self.required_role_labels:
+                if any(
+                    role_matches(shift.get("role", ""), role_label) and self._day_index_for_shift(shift) == day_index
+                    for shift in assignments
+                ):
+                    continue
+                self.errors.append(f"Missing required role {role_label} on {self._day_label(day_index)}.")
+
+    def _count_roles_for_day(
+        self, assignments: List[Dict[str, Any]], day_index: int, predicate: Callable[[str], bool]
+    ) -> int:
+        count = 0
+        for shift in assignments:
+            if self._day_index_for_shift(shift) != day_index:
+                continue
+            role_name = (shift.get("role") or "").lower()
+            if "training" in role_name:
+                continue
+            if predicate(role_name):
+                count += 1
+        return count
+
+    def _day_index_for_shift(self, shift: Dict[str, Any]) -> int:
+        start_date = shift.get("start").date() if isinstance(shift.get("start"), datetime.datetime) else None
+        for ctx in self.day_contexts:
+            if ctx.get("date") == start_date:
+                return ctx.get("day_index", start_date.weekday() if start_date else 0)
+        return start_date.weekday() if start_date else 0
+
+    def _volume_tier(self, demand_index: float) -> str:
+        try:
+            slow_max = float(self.volume_thresholds.get("slow_max", 0.45))
+            moderate_max = float(self.volume_thresholds.get("moderate_max", 0.75))
+        except Exception:  # noqa: BLE001
+            slow_max, moderate_max = 0.45, 0.75
+        if demand_index <= slow_max:
+            return "slow"
+        if demand_index <= moderate_max:
+            return "moderate"
+        return "peak"
 
     def _build_assignment_payload(
         self,

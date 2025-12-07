@@ -16,6 +16,7 @@ from sqlalchemy import select
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
 from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator, QFont
 from PySide6.QtWidgets import (
+    QAbstractSpinBox,
     QAbstractItemView,
     QApplication,
     QCalendarWidget,
@@ -98,7 +99,7 @@ from data_exchange import (
     import_week_projections,
     import_week_schedule,
 )
-from policy import CUT_PRIORITY_DEFAULT, build_default_policy, ensure_default_policy, role_catalog
+from policy import CUT_PRIORITY_DEFAULT, build_default_policy, ensure_default_policy, role_catalog, pre_engine_settings
 from wages import (
     baseline_wages,
     export_wages as export_wages_file,
@@ -190,51 +191,51 @@ def format_time_label(value: datetime.time) -> str:
     suffix = "AM" if value.hour < 12 else "PM"
     return f"{hour}:{value.minute:02d} {suffix}"
 EMPLOYEE_ROLE_GROUPS = {
+    # Note in open/close separation: open/close are paid differently than general servers so its essential the open/close roles are use separately for the time period they are applied to.
     "Bartenders": [
-        "Bartender",
-        "Bartender - Opener",
-        "Bartender - Closer",
-        "Bartender - Training",
+        "Bartender", # bartender logic is simple, usually there is two per day. one opener there until shift change at 4, and then a closer thats there until close. Only on extremer outliers like training or very busy nights are one or two added.
+        "Bartender - Opener", # comes in 30 minutes before open, which is always at 11am
+        "Bartender - Closer", # always works until close and is expected to take the policy set adjustable 30 minutes close time.
+        "Bartender - Training", #set manually like all trainee shifts
     ],
-    "Cashier / Guest Services": [
-        "Cashier",
-        "Cashier - To-Go",
-        "Cashier - Host",
-        "Cashier - Training",
-        "Cashier - All Roles",
+    "Cashier": [
+        # Cashiers responsibilities can be fulfilled when business is slow enough to allow other roles to assist. Primarily by remaining servers and a bartender.
+        "Cashier", # Normally on slower days someone is assigned a general cashier role, expected to do To-Go, Host, 
+        "Cashier - To-Go", # Cashier part 1, handles takeout orders/phone/cashier POS
+        "Cashier - Host", # Cashier part 2, handles seating and cashier POS/phone
+        "Cashier - Training", # training for cashier roles, trained in all roles assumedly
+        "Cashier - All Roles", # trained and able to fulfill all sub roles as needed
     ],
-    "Servers - Dining": [
-        "Server - Dining",
-        "Server - Dining Opener",
-        "Server - Dining Preclose",
-        "Server - Dining Closer",
-        "Server - Training",
-        "Server - All Roles",
-        "Server - Patio",
-    ],
-    "Servers - Cocktail": [
-        "Server - Cocktail",
-        "Server - Cocktail Opener",
-        "Server - Cocktail Preclose",
-        "Server - Cocktail Closer",
+    "Servers": [
+        "Server - Training", # training for server roles, ideally all but we separate to allow for flexibility
+        "Server - All Roles", # able to fulfill all subroles as needed
+        "Server - Opener", # there is only one server opener, not specific to dining or cocktail
+        "Server - Dining", # general server working in dining area can be 1st, 2nd, 3rd cut etc. prefer FIFO/LILO for cuts. Dining normally includes 4, but can include 5 on busier or 6 max busiest days
+        "Server - Dining Preclose", # dining precloser, must be last to leave before dining closer, expected to come in second to last (before dining closer)
+        "Server - Dining Closer", # to adhere to LILO, dining closer should come in last out of the servers in dining, and must work until resteraunt close. Is expected to take est 30 min to close (set in policy)
+        "Server - Patio", # outlier, not dining or cocktail, seasonally scheduled
+        "Server - Cocktail", # general server in cocktail section, on normal days theres 2 cut down to 1. On busier days 3, on busiest 4.
+        "Server - Cocktail Preclose", # LILO, leaves before closer/close but comes in after all other cocktail employees (saving closer)
+        "Server - Cocktail Closer", #LILO, in time is latest in cocktail and works until close and leaves after the expected policy set 30 min of closing time.
     ],
     "Kitchen": [
-        "HOH - Opener",
-        "HOH - Closer",
-        "HOH - Training",
-        "HOH - All Roles",
-        "HOH - Kit",
-        "HOH - Expo",
-        "HOH - Grill",
-        "HOH - Southwest",
-        "HOH - Chip",
-        "HOH - Shake",
-        "HOH - Prep",
-        "HOH - Cook",
+        "HOH - Opener", # comes in 30 minutes before open and works after opentime which is consistently 11am   
+        "HOH - Closer", # works until close and is expected to take the policy set time to close which is currently 30 min i think
+        "HOH - Training", # HOH training for role(s), hopefully listed in notes when trainee scheduled manually
+        "HOH - All Roles", # can perform all duties required of each subrole in HOH/kitchen category set
+        "HOH - Expo", # Works the window/always required and can fulfill other roles when they're absent/cut
+        "HOH - Southwest & Grill", # Combination roles, when not as busy
+        "HOH - Grill", # Often paired with southwest, unless busy.
+        "HOH - Southwest", # Often paired with grill, unless busy.
+        "HOH - Chip & Shake", # Combination role, when not as busy
+        "HOH - Chip", # Often paired with shake, unless busy.
+        "HOH - Shake", # Often paired with chip, unless busy.
+        #"HOH - Prep", # Potential mistake, leaving out because its not always schedule and could just be a note
+        #"HOH - Cook", # Mightve been a mistake, not an actual scheduled role
     ],
     "Management": [
-        "Shift Lead",
-        "MGR - FOH",
+        "Shift Lead", # absolute last resort applied manually, this is not a salaried MGR - FOH, but rather a normally high wage meant to cover a person working and fulfilling multiple roles/in an emergency at the expense of the budget. 
+        "MGR - FOH", # Wage is $0, they are already factored into the budget via salary and do have a wage considered by the scheduler. Meant to be fallback to replace roles (usually in kitchen) as last resort or when not possible to be covered.
     ],
 }
 EMPLOYEE_ROLE_OPTIONS = [role for group in EMPLOYEE_ROLE_GROUPS.values() for role in group]
@@ -2830,7 +2831,7 @@ class SectionCapacityEditor(QWidget):
         self.inputs: Dict[str, Dict[str, QDoubleSpinBox]] = {}
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Capacities bias how long sections stay. Higher weight delays cuts; lower weight cuts sooner."
+            "Section stay bias: enter relative weight (1.0 = normal). Higher weights keep a section staffed longer; lower weights trim sooner."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet(f"color:{INFO_COLOR}; font-weight:500;")
@@ -2845,9 +2846,14 @@ class SectionCapacityEditor(QWidget):
             for section_name in sections:
                 spin = QDoubleSpinBox()
                 spin.setRange(0.2, 3.0)
-                spin.setSingleStep(0.1)
+                spin.setDecimals(2)
+                spin.setSingleStep(0.05)
                 spin.setValue(1.0)
                 spin.setSuffix("x")
+                spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
+                spin.setFocusPolicy(Qt.StrongFocus)
+                spin.wheelEvent = lambda event: event.ignore()
+                spin.setToolTip("Relative section weight: >1 keeps longer, <1 cuts earlier. Type to edit.")
                 tab_layout.addRow(section_name, spin)
                 group_inputs[section_name] = spin
             self.tabs.addTab(tab, group)
@@ -2857,7 +2863,11 @@ class SectionCapacityEditor(QWidget):
         for group, sections in self.inputs.items():
             group_cfg = (config or {}).get(group, {})
             for section_name, spin in sections.items():
-                spin.setValue(float(group_cfg.get(section_name, 1.0)))
+                try:
+                    value = float(group_cfg.get(section_name, 1.0))
+                except (TypeError, ValueError):
+                    value = 1.0
+                spin.setValue(max(spin.minimum(), min(spin.maximum(), value)))
 
     def value(self) -> Dict[str, Dict[str, float]]:
         payload: Dict[str, Dict[str, float]] = {}
@@ -3188,15 +3198,17 @@ class PolicyComposerDialog(QDialog):
             if widget is None:
                 continue
             widget.setFocusPolicy(Qt.StrongFocus)
+            if isinstance(widget, QAbstractSpinBox):
+                widget.setButtonSymbols(QAbstractSpinBox.NoButtons)
             widget.wheelEvent = lambda event: event.ignore()
 
     def _initial_policy(self, params: Dict[str, Any]) -> Dict[str, Any]:
         timeblocks = _timeblocks_from_params(params)
         block_names = [row["name"] for row in timeblocks]
-        default_role_groups = build_default_policy().get("role_groups", {})
         default_shift_presets = build_default_policy().get("shift_presets", {})
         default_seasonal = build_default_policy().get("seasonal_settings", {})
         default_anchors = build_default_policy().get("anchors", {})
+        default_role_groups = build_default_policy().get("role_groups", {})
         roles_payload: Dict[str, Any] = {}
         existing_roles = params.get("roles") if isinstance(params, dict) else {}
         if not isinstance(existing_roles, dict):
@@ -3241,11 +3253,8 @@ class PolicyComposerDialog(QDialog):
                 else {
                     "max_hours_week": 40,
                     "max_consecutive_days": 6,
-                    "round_to_minutes": 15,
-                    "allow_split_shifts": True,
                     "desired_hours_floor_pct": 0.85,
                     "desired_hours_ceiling_pct": 1.15,
-                    "open_buffer_minutes": 30,
                     "close_buffer_minutes": 35,
                     "labor_budget_pct": 0.27,
                     "labor_budget_tolerance_pct": 0.08,
@@ -3278,24 +3287,24 @@ class PolicyComposerDialog(QDialog):
                 else default_seasonal
             ),
             "anchors": params.get("anchors") if isinstance(params.get("anchors"), dict) else default_anchors,
+            "pre_engine": params.get("pre_engine") if isinstance(params.get("pre_engine"), dict) else pre_engine_settings(params),
         }
 
     def _build_global_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
         global_cfg = self.policy_payload.get("global", {})
+        spin_inputs: List[QAbstractSpinBox] = []
 
         self.max_hours_spin = QSpinBox()
         self.max_hours_spin.setRange(10, 80)
         self.max_hours_spin.setValue(int(global_cfg.get("max_hours_week", 40)))
+        spin_inputs.append(self.max_hours_spin)
 
         self.max_consec_spin = QSpinBox()
         self.max_consec_spin.setRange(1, 7)
         self.max_consec_spin.setValue(int(global_cfg.get("max_consecutive_days", 6)))
-
-        self.round_minutes_spin = QSpinBox()
-        self.round_minutes_spin.setRange(5, 60)
-        self.round_minutes_spin.setValue(int(global_cfg.get("round_to_minutes", 15)))
+        spin_inputs.append(self.max_consec_spin)
 
         self.labor_budget_spin = QDoubleSpinBox()
         self.labor_budget_spin.setRange(5.0, 60.0)
@@ -3305,6 +3314,7 @@ class PolicyComposerDialog(QDialog):
         if labor_pct <= 1:
             labor_pct *= 100
         self.labor_budget_spin.setValue(labor_pct)
+        spin_inputs.append(self.labor_budget_spin)
 
         self.labor_tolerance_spin = QDoubleSpinBox()
         self.labor_tolerance_spin.setRange(0.0, 30.0)
@@ -3314,21 +3324,7 @@ class PolicyComposerDialog(QDialog):
         if tolerance_pct <= 1:
             tolerance_pct *= 100
         self.labor_tolerance_spin.setValue(tolerance_pct)
-        anchors_cfg = self.policy_payload.get("anchors", {})
-        self.open_close_combo = QComboBox()
-        self.open_close_combo.addItem("Off (no preference)", "off")
-        self.open_close_combo.addItem("Prefer (recommended)", "prefer")
-        self.open_close_combo.addItem("Enforce (strict FIFO/LILO)", "enforce")
-        order_value = str(anchors_cfg.get("open_close_order", "prefer")).lower()
-        idx = self.open_close_combo.findData(order_value if order_value in {"off", "prefer", "enforce"} else "prefer")
-        if idx >= 0:
-            self.open_close_combo.setCurrentIndex(idx)
-        self.open_close_combo.setToolTip(
-            "Controls opener/closer ordering and staggered cuts: Off = ignore; "
-            "Prefer = keep first-in/first-out when possible; Enforce = strongly prioritize that order."
-        )
-        self.cut_priority_editor = CutPriorityEditor()
-        self.cut_priority_editor.set_config(anchors_cfg.get("cut_priority"))
+        spin_inputs.append(self.labor_tolerance_spin)
         self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
         self.shift_template_editor.set_config(self.policy_payload.get("shift_presets", {}))
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
@@ -3344,12 +3340,10 @@ class PolicyComposerDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
-        guardrails_box = QGroupBox("Scheduling guardrails")
+        guardrails_box = QGroupBox("Scheduling constraints")
         guard_form = QFormLayout(guardrails_box)
         guard_form.addRow("Max hours per week", self.max_hours_spin)
         guard_form.addRow("Max consecutive days", self.max_consec_spin)
-        guard_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
-        guard_form.addRow("Opener/Closer order bias", self.open_close_combo)
         layout.addWidget(guardrails_box)
 
         hours_box = QGroupBox("Operating hours")
@@ -3383,11 +3377,13 @@ class PolicyComposerDialog(QDialog):
         self.desired_floor_spin.setRange(0.0, 150.0)
         self.desired_floor_spin.setSuffix("%")
         self.desired_floor_spin.setValue(max(0.0, min(150.0, desired_floor_pct)))
+        spin_inputs.append(self.desired_floor_spin)
         self.desired_ceiling_spin = QDoubleSpinBox()
         self.desired_ceiling_spin.setDecimals(1)
         self.desired_ceiling_spin.setRange(50.0, 250.0)
         self.desired_ceiling_spin.setSuffix("%")
         self.desired_ceiling_spin.setValue(max(self.desired_floor_spin.value(), min(250.0, desired_ceiling_pct)))
+        spin_inputs.append(self.desired_ceiling_spin)
         self.desired_floor_spin.valueChanged.connect(self._sync_desired_range_bounds)
         self.desired_ceiling_spin.valueChanged.connect(self._sync_desired_range_bounds)
         desired_form.addRow("Minimum coverage (% of desired)", self.desired_floor_spin)
@@ -3402,13 +3398,10 @@ class PolicyComposerDialog(QDialog):
         shift_box = QGroupBox("Shift behavior")
         shift_layout = QVBoxLayout(shift_box)
         buffer_form = QFormLayout()
-        self.open_buffer_spin = QSpinBox()
-        self.open_buffer_spin.setRange(0, 120)
-        self.open_buffer_spin.setValue(int(global_cfg.get("open_buffer_minutes", 30)))
         self.close_buffer_spin = QSpinBox()
         self.close_buffer_spin.setRange(0, 180)
         self.close_buffer_spin.setValue(int(global_cfg.get("close_buffer_minutes", 35)))
-        buffer_form.addRow("Open buffer (minutes)", self.open_buffer_spin)
+        spin_inputs.append(self.close_buffer_spin)
         buffer_form.addRow("Close buffer (minutes)", self.close_buffer_spin)
         shift_layout.addLayout(buffer_form)
         shift_layout.addWidget(split_note)
@@ -3445,6 +3438,7 @@ class PolicyComposerDialog(QDialog):
             cut_spin = QSpinBox()
             cut_spin.setRange(0, 180)
             cut_spin.setValue(int(spec.get("cut_buffer_minutes", 30) or 0))
+            spin_inputs.extend([pct_spin, cut_spin])
             row_layout.addWidget(pct_spin)
             row_layout.addWidget(allow_cuts_box)
             row_layout.addWidget(always_on_box)
@@ -3458,12 +3452,12 @@ class PolicyComposerDialog(QDialog):
                 "always_on": always_on_box,
                 "cut_buffer": cut_spin,
             }
-        layout.addWidget(labor_box)
-        layout.addWidget(self.cut_priority_editor)
+        # Role group allocations and cut rotation are static; omit from UI.
         layout.addWidget(self.shift_template_editor)
         layout.addWidget(self.section_capacity_editor)
         layout.addWidget(seasonal_box)
 
+        self._disable_scroll_wheel(spin_inputs)
         layout.addStretch(1)
         return widget
 
@@ -3522,8 +3516,10 @@ class PolicyComposerDialog(QDialog):
         self.priority_spin = QDoubleSpinBox()
         self.priority_spin.setRange(0.1, 10.0)
         self.priority_spin.setSingleStep(0.1)
+        spin_inputs: List[QAbstractSpinBox] = [self.priority_spin]
         self.max_weekly_spin = QSpinBox()
         self.max_weekly_spin.setRange(5, 80)
+        spin_inputs.append(self.max_weekly_spin)
         form.addRow("Priority weight", self.priority_spin)
         form.addRow("Max weekly hours", self.max_weekly_spin)
         detail_layout.addLayout(form)
@@ -3579,6 +3575,7 @@ class PolicyComposerDialog(QDialog):
             spin = QSpinBox()
             spin.setRange(-5, 10)
             self.daily_spinboxes[day] = spin
+            spin_inputs.append(spin)
             daily_layout.addWidget(QLabel(day), 0, idx)
             daily_layout.addWidget(spin, 1, idx)
         detail_layout.addWidget(daily_box)
@@ -3596,6 +3593,7 @@ class PolicyComposerDialog(QDialog):
 
         layout.addWidget(self.role_list, 1)
         layout.addWidget(self.role_detail, 3)
+        self._disable_scroll_wheel(spin_inputs)
         return widget
 
     def _add_block_row(self) -> None:
@@ -3857,14 +3855,13 @@ class PolicyComposerDialog(QDialog):
         self._persist_role_detail()
         self.policy_payload["name"] = name
         self.policy_payload["description"] = self.description_input.text().strip()
+        floor_pct = round(self.desired_floor_spin.value() / 100, 3)
+        ceil_pct = round(self.desired_ceiling_spin.value() / 100, 3)
         self.policy_payload["global"] = {
             "max_hours_week": self.max_hours_spin.value(),
             "max_consecutive_days": self.max_consec_spin.value(),
-            "round_to_minutes": self.round_minutes_spin.value(),
-            "allow_split_shifts": True,
-            "desired_hours_floor_pct": round(self.desired_floor_spin.value() / 100, 3),
-            "desired_hours_ceiling_pct": round(self.desired_ceiling_spin.value() / 100, 3),
-            "open_buffer_minutes": self.open_buffer_spin.value(),
+            "desired_hours_floor_pct": floor_pct,
+            "desired_hours_ceiling_pct": ceil_pct,
             "close_buffer_minutes": self.close_buffer_spin.value(),
             "labor_budget_pct": round(self.labor_budget_spin.value() / 100, 4),
             "labor_budget_tolerance_pct": round(self.labor_tolerance_spin.value() / 100, 4),
@@ -3887,8 +3884,6 @@ class PolicyComposerDialog(QDialog):
         if role_groups_payload:
             self.policy_payload["role_groups"] = role_groups_payload
         anchors_payload = self.policy_data.get("anchors", build_default_policy().get("anchors", {})).copy()
-        anchors_payload["open_close_order"] = self.open_close_combo.currentData()
-        anchors_payload["cut_priority"] = self.cut_priority_editor.value()
         self.policy_payload["anchors"] = anchors_payload
         self.policy_payload["shift_presets"] = self.shift_template_editor.value()
         seasonal_payload = {"server_patio_enabled": self.patio_toggle.isChecked()}
@@ -3909,6 +3904,7 @@ class PolicyComposerDialog(QDialog):
             "shift_presets": self.policy_payload.get("shift_presets", {}),
             "section_capacity": self.policy_payload.get("section_capacity", {}),
             "anchors": self.policy_payload.get("anchors", {}),
+            "pre_engine": self.policy_payload.get("pre_engine", pre_engine_settings(self.policy_payload)),
         }
         self.result_data = {"name": name, "params": params}
         super().accept()
@@ -3942,14 +3938,12 @@ class PolicyDialog(QDialog):
         name_form.addRow("Description", self.description_input)
         layout.addLayout(name_form)
 
-        global_box = QGroupBox("Global guardrails")
+        global_box = QGroupBox("Scheduling constraints")
         global_form = QFormLayout(global_box)
         self.max_hours_spin = QSpinBox()
         self.max_hours_spin.setRange(10, 80)
         self.max_consec_spin = QSpinBox()
         self.max_consec_spin.setRange(1, 7)
-        self.round_minutes_spin = QSpinBox()
-        self.round_minutes_spin.setRange(5, 60)
         self.desired_floor_spin = QDoubleSpinBox()
         self.desired_floor_spin.setDecimals(1)
         self.desired_floor_spin.setSuffix("%")
@@ -3960,26 +3954,13 @@ class PolicyDialog(QDialog):
         self.desired_ceiling_spin.setRange(50.0, 250.0)
         self.desired_floor_spin.valueChanged.connect(self._sync_desired_range_bounds)
         self.desired_ceiling_spin.valueChanged.connect(self._sync_desired_range_bounds)
-        self.open_buffer_spin = QSpinBox()
-        self.open_buffer_spin.setRange(0, 120)
         self.close_buffer_spin = QSpinBox()
         self.close_buffer_spin.setRange(0, 240)
-        self.open_close_combo = QComboBox()
-        self.open_close_combo.addItem("Off (no preference)", "off")
-        self.open_close_combo.addItem("Prefer (recommended)", "prefer")
-        self.open_close_combo.addItem("Enforce (strict FIFO/LILO)", "enforce")
-        self.open_close_combo.setToolTip(
-            "Controls opener/closer ordering and staggered cuts: Off = ignore; "
-            "Prefer = keep first-in/first-out when possible; Enforce = strongly prioritize that order."
-        )
         global_form.addRow("Max hours per week", self.max_hours_spin)
         global_form.addRow("Max consecutive days", self.max_consec_spin)
-        global_form.addRow("Adjacent block gap tolerance (minutes)", self.round_minutes_spin)
         global_form.addRow("Desired hours min%", self.desired_floor_spin)
         global_form.addRow("Desired hours max%", self.desired_ceiling_spin)
-        global_form.addRow("Open buffer (minutes)", self.open_buffer_spin)
         global_form.addRow("Close buffer (minutes)", self.close_buffer_spin)
-        global_form.addRow("Opener/Closer order bias", self.open_close_combo)
         layout.addWidget(global_box)
 
         labor_box = QGroupBox()
@@ -4000,7 +3981,7 @@ class PolicyDialog(QDialog):
         time_box = QGroupBox()
         time_box.setTitle("")
         time_layout = QVBoxLayout(time_box)
-        hours_note = QLabel("Set open/close per day. Morning/Evening blocks are derived from these hours plus buffers.")
+        hours_note = QLabel("Business hours rarely change. GM-only edits; buffers apply automatically.")
         hours_note.setWordWrap(True)
         time_layout.addWidget(hours_note)
         self.hours_table = QTableWidget(len(WEEKDAY_LABELS), 4)
@@ -4026,10 +4007,9 @@ class PolicyDialog(QDialog):
             self.hours_table.setItem(row, 2, am_item)
             self.hours_table.setItem(row, 3, close_item)
         time_layout.addWidget(self.hours_table)
-        layout.addWidget(time_box)
+        layout.addWidget(self._make_collapsible("Business Hours (caution)", time_box))
 
-        groups_box = QGroupBox()
-        groups_box.setTitle("")
+        groups_box = QGroupBox("Role group allocations")
         groups_layout = QVBoxLayout(groups_box)
         self.role_group_table = QTableWidget(len(ROLE_GROUPS), 2)
         self.role_group_table.setHorizontalHeaderLabels(["Group", "Allocation %"])
@@ -4038,8 +4018,7 @@ class PolicyDialog(QDialog):
         self.role_group_table.verticalHeader().setVisible(False)
         groups_layout.addWidget(self.role_group_table)
         layout.addWidget(groups_box)
-        self.cut_priority_editor = CutPriorityEditor()
-        layout.addWidget(self.cut_priority_editor)
+
         self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
         layout.addWidget(self.shift_template_editor)
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
@@ -4051,6 +4030,7 @@ class PolicyDialog(QDialog):
         self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
         seasonal_layout.addWidget(self.patio_toggle)
         layout.addWidget(seasonal_box)
+        self._build_pre_engine_section(layout)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
@@ -4079,10 +4059,8 @@ class PolicyDialog(QDialog):
             [
                 self.max_hours_spin,
                 self.max_consec_spin,
-                self.round_minutes_spin,
                 self.desired_floor_spin,
                 self.desired_ceiling_spin,
-                self.open_buffer_spin,
                 self.close_buffer_spin,
                 self.labor_budget_spin,
                 self.labor_tolerance_spin,
@@ -4096,22 +4074,41 @@ class PolicyDialog(QDialog):
                 self.description_input,
                 self.max_hours_spin,
                 self.max_consec_spin,
-                self.round_minutes_spin,
                 self.desired_floor_spin,
                 self.desired_ceiling_spin,
-                self.open_buffer_spin,
                 self.close_buffer_spin,
-                self.open_close_combo,
                 self.labor_budget_spin,
                 self.labor_tolerance_spin,
-                self.hours_table,
                 self.role_group_table,
+                self.hours_table,
+                self.dining_slow_min_spin,
+                self.dining_slow_max_spin,
+                self.dining_moderate_spin,
+                self.dining_peak_spin,
+                self.dining_manual_spin,
+                self.server_opener_spin,
+                self.cocktail_normal_spin,
+                self.cocktail_busy_spin,
+                self.cocktail_peak_spin,
+                self.cocktail_manual_spin,
+                self.cashier_am_spin,
+                self.cashier_pm_spin,
+                self.cashier_busy_spin,
+                self.cashier_peak_spin,
+                self.cashier_manual_spin,
+                self.hoh_low_spin,
+                self.hoh_split_spin,
+                self.hoh_peak_spin,
+                self.fallback_allow_mgr,
+                self.fallback_am_limit,
+                self.fallback_pm_limit,
+                self.budget_mode_combo,
+                self.budget_tolerance_spin,
             ]:
                 widget.setEnabled(False)
             self.save_button.setEnabled(False)
             self.export_button.setEnabled(False)
             self.import_button.setEnabled(False)
-            self.cut_priority_editor.set_read_only(True)
             self.shift_template_editor.setEnabled(False)
             self.section_capacity_editor.setEnabled(False)
 
@@ -4133,19 +4130,11 @@ class PolicyDialog(QDialog):
         global_cfg = self.policy_data.get("global", {})
         self.max_hours_spin.setValue(int(global_cfg.get("max_hours_week", 40)))
         self.max_consec_spin.setValue(int(global_cfg.get("max_consecutive_days", 6)))
-        self.round_minutes_spin.setValue(int(global_cfg.get("round_to_minutes", 15)))
         floor = float(global_cfg.get("desired_hours_floor_pct", 0.85) or 0.0) * 100
         ceil = float(global_cfg.get("desired_hours_ceiling_pct", 1.15) or 0.0) * 100
         self.desired_floor_spin.setValue(floor)
         self.desired_ceiling_spin.setValue(max(self.desired_floor_spin.value(), ceil))
-        self.open_buffer_spin.setValue(int(global_cfg.get("open_buffer_minutes", 30)))
         self.close_buffer_spin.setValue(int(global_cfg.get("close_buffer_minutes", 35)))
-        anchors_cfg = self.policy_data.get("anchors", {})
-        order_value = str(anchors_cfg.get("open_close_order", "prefer")).lower()
-        idx = self.open_close_combo.findData(order_value if order_value in {"off", "prefer", "enforce"} else "prefer")
-        if idx >= 0:
-            self.open_close_combo.setCurrentIndex(idx)
-        self.cut_priority_editor.set_config(anchors_cfg.get("cut_priority"))
         self.shift_template_editor.set_config(self.policy_data.get("shift_presets", {}))
         self.section_capacity_editor.set_config(self.policy_data.get("section_capacity", {}))
         labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
@@ -4157,6 +4146,8 @@ class PolicyDialog(QDialog):
             labor_tol *= 100
         self.labor_tolerance_spin.setValue(labor_tol)
         self._load_hours_table()
+        self._populate_role_groups()
+        self._apply_pre_engine_values()
         self._populate_role_groups()
 
     def _sync_desired_range_bounds(self) -> None:
@@ -4189,6 +4180,99 @@ class PolicyDialog(QDialog):
             hours[day] = {"open": open_label, "mid": mid_label, "close": close_label}
         return hours
 
+    def _apply_pre_engine_values(self) -> None:
+        cfg = pre_engine_settings(self.policy_data)
+        staffing = cfg.get("staffing", {})
+        server_cfg = staffing.get("servers", {})
+        dining_cfg = server_cfg.get("dining", {})
+        cocktail_cfg = server_cfg.get("cocktail", {})
+        cashier_cfg = staffing.get("cashier", {})
+        hoh_cfg = staffing.get("hoh", {})
+        fallback_cfg = cfg.get("fallback", {})
+        budget_cfg = cfg.get("budget", {})
+        self.dining_slow_min_spin.setValue(int(dining_cfg.get("slow_min", 1)))
+        self.dining_slow_max_spin.setValue(int(dining_cfg.get("slow_max", 4)))
+        self.dining_moderate_spin.setValue(int(dining_cfg.get("moderate", 5)))
+        self.dining_peak_spin.setValue(int(dining_cfg.get("peak", 6)))
+        self.dining_manual_spin.setValue(int(dining_cfg.get("manual_max", 7)))
+        self.server_opener_spin.setValue(int(server_cfg.get("opener_count", 1)))
+        self.cocktail_normal_spin.setValue(int(cocktail_cfg.get("normal", 2)))
+        self.cocktail_busy_spin.setValue(int(cocktail_cfg.get("busy", 3)))
+        self.cocktail_peak_spin.setValue(int(cocktail_cfg.get("peak", 4)))
+        self.cocktail_manual_spin.setValue(int(cocktail_cfg.get("manual_max", 4)))
+        self.cashier_am_spin.setValue(int(cashier_cfg.get("am_default", 1)))
+        self.cashier_pm_spin.setValue(int(cashier_cfg.get("pm_default", 1)))
+        self.cashier_busy_spin.setValue(int(cashier_cfg.get("busy_split", 2)))
+        self.cashier_peak_spin.setValue(int(cashier_cfg.get("peak", 3)))
+        self.cashier_manual_spin.setValue(int(cashier_cfg.get("manual_max", 4)))
+        thresholds = hoh_cfg.get("combo_thresholds", {})
+        self.hoh_low_spin.setValue(float(thresholds.get("low_max", 0.55)))
+        self.hoh_split_spin.setValue(float(thresholds.get("split_min", 0.75)))
+        self.hoh_peak_spin.setValue(float(thresholds.get("peak_min", 1.0)))
+        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
+        self.fallback_am_limit.setValue(int(fallback_cfg.get("am_limit", 1)))
+        self.fallback_pm_limit.setValue(int(fallback_cfg.get("pm_limit", 1)))
+        budget_tolerance = float(budget_cfg.get("tolerance_pct", 8.0) or 0.0)
+        if budget_tolerance <= 1:
+            budget_tolerance *= 100
+        self.budget_tolerance_spin.setValue(budget_tolerance)
+        mode_value = str(budget_cfg.get("mode", "adaptive")).lower()
+        idx = self.budget_mode_combo.findData(mode_value if mode_value in {"adaptive", "strict"} else "adaptive")
+        if idx >= 0:
+            self.budget_mode_combo.setCurrentIndex(idx)
+
+    def _read_pre_engine_controls(self) -> Dict[str, Any]:
+        cfg = pre_engine_settings(self.policy_data)
+        staffing = cfg.get("staffing", {})
+        budget_cfg_raw = cfg.get("budget")
+        budget_cfg = budget_cfg_raw if isinstance(budget_cfg_raw, dict) else {}
+        payload = copy.deepcopy(cfg)
+        payload.setdefault("staffing", {})
+        payload["staffing"]["servers"] = {
+            "dining": {
+                "slow_min": self.dining_slow_min_spin.value(),
+                "slow_max": self.dining_slow_max_spin.value(),
+                "moderate": self.dining_moderate_spin.value(),
+                "peak": self.dining_peak_spin.value(),
+                "manual_max": self.dining_manual_spin.value(),
+            },
+            "cocktail": {
+                "normal": self.cocktail_normal_spin.value(),
+                "busy": self.cocktail_busy_spin.value(),
+                "peak": self.cocktail_peak_spin.value(),
+                "manual_max": self.cocktail_manual_spin.value(),
+            },
+            "opener_count": self.server_opener_spin.value(),
+        }
+        payload["staffing"]["cashier"] = {
+            "am_default": self.cashier_am_spin.value(),
+            "pm_default": self.cashier_pm_spin.value(),
+            "busy_split": self.cashier_busy_spin.value(),
+            "peak": self.cashier_peak_spin.value(),
+            "manual_max": self.cashier_manual_spin.value(),
+        }
+        payload["staffing"]["hoh"] = {
+            "combo_thresholds": {
+                "low_max": round(self.hoh_low_spin.value(), 2),
+                "split_min": round(self.hoh_split_spin.value(), 2),
+                "peak_min": round(self.hoh_peak_spin.value(), 2),
+            },
+            **{k: v for k, v in staffing.get("hoh", {}).items() if k not in {"combo_thresholds"}},
+        }
+        payload["fallback"] = {
+            "allow_mgr_fallback": self.fallback_allow_mgr.isChecked(),
+            "am_limit": self.fallback_am_limit.value(),
+            "pm_limit": self.fallback_pm_limit.value(),
+            "tag": cfg.get("fallback", {}).get("tag", "MANAGER COVERING — REVIEW REQUIRED"),
+            "disallow_roles": cfg.get("fallback", {}).get("disallow_roles", []),
+        }
+        payload["budget"] = {
+            **budget_cfg,
+            "mode": self.budget_mode_combo.currentData(),
+            "tolerance_pct": round(self.budget_tolerance_spin.value(), 2),
+        }
+        return payload
+
     def _build_timeblocks(self) -> Dict[str, Dict[str, str]]:
         close_buffer = self.close_buffer_spin.value()
         return {
@@ -4199,39 +4283,210 @@ class PolicyDialog(QDialog):
         }
 
     def _populate_role_groups(self) -> None:
-        groups_spec = self.policy_data.get("role_groups") or {}
+        groups_spec = self.policy_data.get("role_groups") or build_default_policy().get("role_groups", {})
         self.role_group_widgets.clear()
+        # Clear stale widgets so we don't retain any unexpected editors in the Group column.
+        self.role_group_table.clearContents()
         self.role_group_table.setRowCount(len(ROLE_GROUPS))
         for row, group in enumerate(ROLE_GROUPS.keys()):
             spec = groups_spec.get(group, {})
             pct = float(spec.get("allocation_pct", 0.0) or 0.0)
             if pct <= 1:
                 pct *= 100
+            label = "Heart of House" if group == "Kitchen" else group
             allocation_spin = QDoubleSpinBox()
             allocation_spin.setDecimals(1)
             allocation_spin.setRange(0.0, 100.0)
             allocation_spin.setSuffix("%")
             allocation_spin.setValue(pct)
             PolicyComposerDialog._disable_scroll_wheel([allocation_spin])
-            self.role_group_table.setItem(row, 0, QTableWidgetItem(group))
+            self.role_group_table.setItem(row, 0, QTableWidgetItem(label))
             self.role_group_table.item(row, 0).setFlags(Qt.ItemIsEnabled)
             self.role_group_table.setCellWidget(row, 1, allocation_spin)
             self.role_group_widgets[group] = {"pct": allocation_spin}
             if self.read_only:
                 allocation_spin.setEnabled(False)
 
+    def _build_pre_engine_section(self, layout: QVBoxLayout) -> None:
+        cfg = pre_engine_settings(self.policy_data)
+        staffing = cfg.get("staffing", {})
+        server_cfg = staffing.get("servers", {})
+        dining_cfg = server_cfg.get("dining", {})
+        cocktail_cfg = server_cfg.get("cocktail", {})
+        cashier_cfg = staffing.get("cashier", {})
+        hoh_cfg = staffing.get("hoh", {})
+        fallback_cfg = cfg.get("fallback", {})
+        budget_cfg = cfg.get("budget", {})
+
+        box = QGroupBox("Staffing guardrails and fallback")
+        outer = QVBoxLayout(box)
+
+        server_box = QGroupBox("Servers")
+        server_form = QFormLayout(server_box)
+        self.dining_slow_min_spin = QSpinBox()
+        self.dining_slow_min_spin.setRange(0, 20)
+        self.dining_slow_min_spin.setValue(int(dining_cfg.get("slow_min", 1)))
+        self.dining_slow_max_spin = QSpinBox()
+        self.dining_slow_max_spin.setRange(0, 20)
+        self.dining_slow_max_spin.setValue(int(dining_cfg.get("slow_max", 4)))
+        self.dining_moderate_spin = QSpinBox()
+        self.dining_moderate_spin.setRange(0, 30)
+        self.dining_moderate_spin.setValue(int(dining_cfg.get("moderate", 5)))
+        self.dining_peak_spin = QSpinBox()
+        self.dining_peak_spin.setRange(0, 30)
+        self.dining_peak_spin.setValue(int(dining_cfg.get("peak", 6)))
+        self.dining_manual_spin = QSpinBox()
+        self.dining_manual_spin.setRange(0, 40)
+        self.dining_manual_spin.setValue(int(dining_cfg.get("manual_max", 7)))
+        self.server_opener_spin = QSpinBox()
+        self.server_opener_spin.setRange(0, 5)
+        self.server_opener_spin.setValue(int(server_cfg.get("opener_count", 1)))
+        server_form.addRow("Dining slow (min/max)", self._paired_spin(self.dining_slow_min_spin, self.dining_slow_max_spin))
+        server_form.addRow("Dining moderate", self.dining_moderate_spin)
+        server_form.addRow("Dining peak", self.dining_peak_spin)
+        server_form.addRow("Dining manual override >", self.dining_manual_spin)
+        server_form.addRow("Server opener count", self.server_opener_spin)
+
+        self.cocktail_normal_spin = QSpinBox()
+        self.cocktail_normal_spin.setRange(0, 20)
+        self.cocktail_normal_spin.setValue(int(cocktail_cfg.get("normal", 2)))
+        self.cocktail_busy_spin = QSpinBox()
+        self.cocktail_busy_spin.setRange(0, 20)
+        self.cocktail_busy_spin.setValue(int(cocktail_cfg.get("busy", 3)))
+        self.cocktail_peak_spin = QSpinBox()
+        self.cocktail_peak_spin.setRange(0, 20)
+        self.cocktail_peak_spin.setValue(int(cocktail_cfg.get("peak", 4)))
+        self.cocktail_manual_spin = QSpinBox()
+        self.cocktail_manual_spin.setRange(0, 30)
+        self.cocktail_manual_spin.setValue(int(cocktail_cfg.get("manual_max", 4)))
+        server_form.addRow("Cocktail normal/busy", self._paired_spin(self.cocktail_normal_spin, self.cocktail_busy_spin))
+        server_form.addRow("Cocktail peak", self.cocktail_peak_spin)
+        server_form.addRow("Cocktail manual override >", self.cocktail_manual_spin)
+        outer.addWidget(server_box)
+
+        cashier_box = QGroupBox("Cashier")
+        cashier_form = QFormLayout(cashier_box)
+        self.cashier_am_spin = QSpinBox()
+        self.cashier_am_spin.setRange(0, 6)
+        self.cashier_am_spin.setValue(int(cashier_cfg.get("am_default", 1)))
+        self.cashier_pm_spin = QSpinBox()
+        self.cashier_pm_spin.setRange(0, 6)
+        self.cashier_pm_spin.setValue(int(cashier_cfg.get("pm_default", 1)))
+        self.cashier_busy_spin = QSpinBox()
+        self.cashier_busy_spin.setRange(0, 6)
+        self.cashier_busy_spin.setValue(int(cashier_cfg.get("busy_split", 2)))
+        self.cashier_peak_spin = QSpinBox()
+        self.cashier_peak_spin.setRange(0, 6)
+        self.cashier_peak_spin.setValue(int(cashier_cfg.get("peak", 3)))
+        self.cashier_manual_spin = QSpinBox()
+        self.cashier_manual_spin.setRange(0, 8)
+        self.cashier_manual_spin.setValue(int(cashier_cfg.get("manual_max", 4)))
+        cashier_form.addRow("AM cashiers", self.cashier_am_spin)
+        cashier_form.addRow("PM cashiers", self.cashier_pm_spin)
+        cashier_form.addRow("Busy split (To-Go + Host)", self.cashier_busy_spin)
+        cashier_form.addRow("Peak cashiers", self.cashier_peak_spin)
+        cashier_form.addRow("Manual override >", self.cashier_manual_spin)
+        outer.addWidget(cashier_box)
+
+        hoh_box = QGroupBox("HOH (Heart of House)")
+        hoh_form = QFormLayout(hoh_box)
+        thresholds = hoh_cfg.get("combo_thresholds", {})
+        self.hoh_low_spin = QDoubleSpinBox()
+        self.hoh_low_spin.setDecimals(2)
+        self.hoh_low_spin.setRange(0.0, 3.0)
+        self.hoh_low_spin.setValue(float(thresholds.get("low_max", 0.55)))
+        self.hoh_split_spin = QDoubleSpinBox()
+        self.hoh_split_spin.setDecimals(2)
+        self.hoh_split_spin.setRange(0.0, 3.0)
+        self.hoh_split_spin.setValue(float(thresholds.get("split_min", 0.75)))
+        self.hoh_peak_spin = QDoubleSpinBox()
+        self.hoh_peak_spin.setDecimals(2)
+        self.hoh_peak_spin.setRange(0.0, 3.0)
+        self.hoh_peak_spin.setValue(float(thresholds.get("peak_min", 1.0)))
+        hoh_form.addRow("Combo enabled ≤ demand", self.hoh_low_spin)
+        hoh_form.addRow("Split threshold", self.hoh_split_spin)
+        hoh_form.addRow("Peak threshold", self.hoh_peak_spin)
+        outer.addWidget(hoh_box)
+
+        fallback_box = QGroupBox("Fallback & budget")
+        fallback_form = QFormLayout(fallback_box)
+        self.fallback_allow_mgr = QCheckBox("Allow MGR–FOH fallback")
+        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
+        self.fallback_am_limit = QSpinBox()
+        self.fallback_am_limit.setRange(0, 3)
+        self.fallback_am_limit.setValue(int(fallback_cfg.get("am_limit", 1)))
+        self.fallback_pm_limit = QSpinBox()
+        self.fallback_pm_limit.setRange(0, 3)
+        self.fallback_pm_limit.setValue(int(fallback_cfg.get("pm_limit", 1)))
+        self.budget_mode_combo = QComboBox()
+        self.budget_mode_combo.addItem("Adaptive", "adaptive")
+        self.budget_mode_combo.addItem("Strict", "strict")
+        mode_value = str(budget_cfg.get("mode", "adaptive")).lower()
+        idx = self.budget_mode_combo.findData(mode_value if mode_value in {"adaptive", "strict"} else "adaptive")
+        if idx >= 0:
+            self.budget_mode_combo.setCurrentIndex(idx)
+        self.budget_tolerance_spin = QDoubleSpinBox()
+        self.budget_tolerance_spin.setRange(0.0, 50.0)
+        self.budget_tolerance_spin.setDecimals(1)
+        self.budget_tolerance_spin.setSuffix("%")
+        budget_tolerance = float(budget_cfg.get("tolerance_pct", 8.0) or 0.0)
+        if budget_tolerance <= 1:
+            budget_tolerance *= 100
+        self.budget_tolerance_spin.setValue(budget_tolerance)
+        fallback_form.addRow(self.fallback_allow_mgr)
+        fallback_form.addRow("AM fallback limit", self.fallback_am_limit)
+        fallback_form.addRow("PM fallback limit", self.fallback_pm_limit)
+        fallback_form.addRow("Budget mode", self.budget_mode_combo)
+        fallback_form.addRow("Budget tolerance (±%)", self.budget_tolerance_spin)
+        outer.addWidget(fallback_box)
+
+        layout.addWidget(box)
+        PolicyComposerDialog._disable_scroll_wheel(
+            [
+                self.dining_slow_min_spin,
+                self.dining_slow_max_spin,
+                self.dining_moderate_spin,
+                self.dining_peak_spin,
+                self.dining_manual_spin,
+                self.server_opener_spin,
+                self.cocktail_normal_spin,
+                self.cocktail_busy_spin,
+                self.cocktail_peak_spin,
+                self.cocktail_manual_spin,
+                self.cashier_am_spin,
+                self.cashier_pm_spin,
+                self.cashier_busy_spin,
+                self.cashier_peak_spin,
+                self.cashier_manual_spin,
+                self.hoh_low_spin,
+                self.hoh_split_spin,
+                self.hoh_peak_spin,
+                self.fallback_am_limit,
+                self.fallback_pm_limit,
+                self.budget_tolerance_spin,
+            ]
+        )
+
+    @staticmethod
+    def _paired_spin(first: QWidget, second: QWidget) -> QWidget:
+        wrapper = QWidget()
+        layout = QHBoxLayout(wrapper)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(first)
+        layout.addWidget(QLabel("/"))
+        layout.addWidget(second)
+        return wrapper
     def _read_role_groups(self) -> Dict[str, Dict[str, Any]]:
         payload: Dict[str, Dict[str, Any]] = {}
         existing = self.policy_data.get("role_groups", {})
         for group, widgets in self.role_group_widgets.items():
             pct_spin: QDoubleSpinBox = widgets["pct"]
             label_pct = pct_spin.value() / 100.0
-            existing_group = existing.get(group, {})
             payload[group] = {
                 "allocation_pct": round(label_pct, 4),
-                "allow_cuts": existing_group.get("allow_cuts", True),
-                "cut_buffer_minutes": existing_group.get("cut_buffer_minutes", 0),
-                "always_on": existing_group.get("always_on", False),
+                "allow_cuts": existing.get(group, {}).get("allow_cuts", True),
+                "cut_buffer_minutes": existing.get(group, {}).get("cut_buffer_minutes", 0),
+                "always_on": existing.get(group, {}).get("always_on", False),
             }
         return payload
 
@@ -4244,11 +4499,8 @@ class PolicyDialog(QDialog):
             "global": {
                 "max_hours_week": self.max_hours_spin.value(),
                 "max_consecutive_days": self.max_consec_spin.value(),
-                "round_to_minutes": self.round_minutes_spin.value(),
-                "allow_split_shifts": True,
                 "desired_hours_floor_pct": round(self.desired_floor_spin.value() / 100, 3),
                 "desired_hours_ceiling_pct": round(self.desired_ceiling_spin.value() / 100, 3),
-                "open_buffer_minutes": self.open_buffer_spin.value(),
                 "close_buffer_minutes": self.close_buffer_spin.value(),
                 "labor_budget_pct": round(self.labor_budget_spin.value() / 100, 4),
                 "labor_budget_tolerance_pct": round(self.labor_tolerance_spin.value() / 100, 4),
@@ -4261,13 +4513,12 @@ class PolicyDialog(QDialog):
             "section_capacity": self.section_capacity_editor.value(),
             "seasonal_settings": self.policy_data.get("seasonal_settings", {}),
             "anchors": self._collect_anchors_payload(),
+            "pre_engine": self._read_pre_engine_controls(),
         }
         return params
 
     def _collect_anchors_payload(self) -> Dict[str, Any]:
         anchors = copy.deepcopy(self.policy_data.get("anchors") or {})
-        anchors["open_close_order"] = self.open_close_combo.currentData()
-        anchors["cut_priority"] = self.cut_priority_editor.value()
         return anchors
 
     def _save_policy(self) -> None:
@@ -4363,10 +4614,10 @@ class PolicyDialog(QDialog):
         self.policy_data.setdefault("roles", defaults.get("roles", {}))
         self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
         anchors_defaults = defaults.get("anchors", {})
-        anchors_payload = self.policy_data.setdefault("anchors", anchors_defaults.copy())
-        anchors_payload.setdefault("cut_priority", anchors_defaults.get("cut_priority", {}))
+        self.policy_data.setdefault("anchors", anchors_defaults.copy())
         self.policy_data.setdefault("shift_presets", defaults.get("shift_presets", {}))
         self.policy_data.setdefault("section_capacity", defaults.get("section_capacity", {}))
+        self.policy_data.setdefault("pre_engine", pre_engine_settings(self.policy_data))
         hours = self.policy_data.setdefault("business_hours", defaults.get("business_hours", _default_business_hours()))
         defaults_hours = defaults.get("business_hours", _default_business_hours())
         for day in WEEKDAY_LABELS:
@@ -4380,6 +4631,8 @@ class PolicyDialog(QDialog):
             if widget is None:
                 continue
             widget.setFocusPolicy(Qt.StrongFocus)
+            if isinstance(widget, QAbstractSpinBox):
+                widget.setButtonSymbols(QAbstractSpinBox.NoButtons)
             widget.wheelEvent = lambda event: event.ignore()
 
     @staticmethod
