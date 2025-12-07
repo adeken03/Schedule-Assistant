@@ -30,4 +30,4 @@ jobs:
         env:
           PYTHONPATH: app
         run: |
-          python -m pytest -q
+          python -m pytest -vv --maxfail=1 -ra
