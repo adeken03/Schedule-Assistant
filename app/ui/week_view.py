@@ -4,7 +4,9 @@ import datetime
 from typing import Callable, Dict, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QDate
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QBrush, QPainter, QPalette, QPen
+from PySide6.QtWidgets import QStyledItemDelegate, QStyleOptionViewItem
+from PySide6.QtWidgets import QStyle
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -48,6 +50,39 @@ from ui.edit_shift import EditShiftDialog
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 ROLE_GROUP_ORDER = ["Kitchen", "Servers", "Bartenders", "Cashier", "Other"]
+
+
+class ColorDelegate(QStyledItemDelegate):
+    """Force painting with the item's brush roles so stylesheets can't mask colors."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        # Use provided background/foreground brushes directly.
+        bg = index.data(Qt.BackgroundRole)
+        fg = index.data(Qt.ForegroundRole)
+        opt = QStyleOptionViewItem(option)
+        # Prevent the style from painting its own selection background.
+        opt.state = opt.state & ~QStyle.State_Selected
+        painter.save()
+        if bg:
+            painter.fillRect(opt.rect, bg)
+        # Draw a subtle border.
+        border_pen = QPen(QColor("#0f0f10"))
+        border_pen.setWidth(1)
+        painter.setPen(border_pen)
+        painter.drawRect(opt.rect.adjusted(0, 0, -1, -1))
+        # Default pen; override if fg provided.
+        default_pen = QPen(QColor(Qt.white))
+        painter.setPen(default_pen)
+        if fg:
+            painter.setPen(QPen(fg.color()))
+        # Draw text manually to ensure it appears over our fill.
+        text = index.data(Qt.DisplayRole) or ""
+        painter.drawText(
+            opt.rect.adjusted(6, 4, -6, -4),
+            Qt.TextWordWrap | Qt.AlignTop | Qt.AlignLeft,
+            text,
+        )
+        painter.restore()
 
 
 class WeekSchedulePage(QWidget):
@@ -139,20 +174,13 @@ class WeekSchedulePage(QWidget):
         self.role_filter.currentIndexChanged.connect(self.refresh_shifts)
         filters.addWidget(self._wrap_with_label("Role", self.role_filter))
 
-        self.status_filter = QComboBox()
-        for status in ["All", "Draft", "Validated", "Exported"]:
-            self.status_filter.addItem(status, status.lower())
-        self.status_filter.currentIndexChanged.connect(self.refresh_shifts)
-        filters.addWidget(self._wrap_with_label("Status", self.status_filter))
-
         self.search_input = QLineEdit()
         self.search_input.setPlaceholderText("Search name, role, or notes...")
         self.search_input.textChanged.connect(self._apply_search_filter)
         filters.addWidget(self._wrap_with_label("Search", self.search_input))
 
-        self.hide_unassigned_checkbox = QCheckBox("Hide unassigned")
-        self.hide_unassigned_checkbox.stateChanged.connect(self._apply_search_filter)
-        filters.addWidget(self.hide_unassigned_checkbox)
+        self.unassigned_label = QLabel("Unassigned: 0")
+        filters.addWidget(self.unassigned_label)
         filters.addStretch()
         return filters
 
@@ -170,6 +198,29 @@ class WeekSchedulePage(QWidget):
             column.addWidget(header_label)
 
             list_widget = QListWidget()
+            # Keep container styling minimal; let per-item brushes show through.
+            list_widget.setStyleSheet(
+                """
+                QListWidget {
+                    background: transparent;
+                    border: 1px solid #1c1d23;
+                    border-radius: 12px;
+                }
+                QListWidget::item {
+                    background-color: none;
+                    border-radius: 8px;
+                    margin: 2px;
+                    padding: 4px;
+                    border: 1px solid #050505;
+                }
+                QListWidget::item:selected {
+                    background-color: #f5b942;
+                    color: #0b0b0f;
+                }
+                """
+            )
+            list_widget.setAutoFillBackground(False)
+            list_widget.setItemDelegate(ColorDelegate(list_widget))
             list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
             list_widget.itemSelectionChanged.connect(self._handle_selection_changed)
             list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_shift())
@@ -274,9 +325,7 @@ class WeekSchedulePage(QWidget):
         selected_role = self.role_filter.currentData()
         selected_group = self.role_group_filter.currentData() if self.role_group_filter.count() else None
         role_param = selected_role if selected_role else None
-        status_value = self.status_filter.currentData()
-        if status_value == "all":
-            status_value = None
+        status_value = None
         with self.session_factory() as session:
             shifts = get_shifts_for_week(
                 session,
@@ -298,6 +347,7 @@ class WeekSchedulePage(QWidget):
             self.current_shifts = [
                 shift for shift in self.current_shifts if shift.get("role") in allowed_roles
             ]
+        self._update_unassigned_count()
         self._apply_search_filter()
 
     def _populate_filters(self) -> None:
@@ -321,7 +371,20 @@ class WeekSchedulePage(QWidget):
     def _rebuild_role_filters(self) -> None:
         roles_from_sources = set(self.role_options)
         roles_from_sources.update(role_catalog(self.policy))
-        filtered_roles = sorted({role for role in roles_from_sources if role and not is_manager_role(role)})
+        banned_roles = {
+            "server - cocktail opener",
+            "server - dining opener",
+        }
+        filtered_roles = sorted(
+            {
+                role
+                for role in roles_from_sources
+                if role
+                and not is_manager_role(role)
+                and (role.lower() not in banned_roles)
+                and ("all roles" not in role.lower())
+            }
+        )
         self._roles_by_group = grouped_roles(filtered_roles)
 
         self.role_group_filter.blockSignals(True)
@@ -374,13 +437,15 @@ class WeekSchedulePage(QWidget):
                 if term in haystack:
                     filtered.append(shift)
             self.filtered_shifts = filtered
-        if getattr(self, "hide_unassigned_checkbox", None) and self.hide_unassigned_checkbox.isChecked():
-            self.filtered_shifts = [
-                shift for shift in self.filtered_shifts if shift.get("employee_id") is not None
-            ]
         self._render_shift_grid()
         self._render_summary()
         self._update_action_states()
+
+    def _update_unassigned_count(self) -> None:
+        if not getattr(self, "unassigned_label", None):
+            return
+        count = sum(1 for shift in self.current_shifts if shift.get("employee_id") is None)
+        self.unassigned_label.setText(f"Unassigned: {count}")
 
     def _render_shift_grid(self) -> None:
         by_day: Dict[int, List[Dict]] = {idx: [] for idx in range(7)}
@@ -403,8 +468,13 @@ class WeekSchedulePage(QWidget):
                 item = QListWidgetItem(text)
                 item.setData(Qt.UserRole, shift["id"])
                 bg_color, fg_color = self._color_for_shift(shift)
-                item.setBackground(bg_color)
-                item.setForeground(fg_color)
+                brush_bg = QBrush(bg_color)
+                brush_fg = QBrush(fg_color)
+                item.setBackground(brush_bg)
+                item.setForeground(brush_fg)
+                item.setData(Qt.BackgroundRole, brush_bg)
+                item.setData(Qt.ForegroundRole, brush_fg)
+                item.setData(Qt.UserRole + 1, "force-bg")  # marker to avoid stylesheet overrides
                 item.setToolTip(f"{shift.get('role')} \u2014 {shift.get('employee_name') or 'Unassigned'}")
                 if shift["id"] in selected_set:
                     item.setSelected(True)
@@ -466,16 +536,12 @@ class WeekSchedulePage(QWidget):
         return f"{start.strftime('%H:%M')} - {end.strftime('%H:%M')}\n{employee}\n{group_line}{notes_line}"
 
     def _color_for_shift(self, shift: Dict) -> Tuple[QColor, QColor]:
-        base = QColor(palette_for_role(shift.get("role")))
-        key = shift.get("employee_id") or shift.get("employee_name") or shift.get("role") or ""
-        try:
-            seed = hash(key)
-        except Exception:
-            seed = 0
-        tweak = 110 + (abs(seed) % 22)
-        bg = base.lighter(tweak)
-        bg.setAlpha(230)
-        fg = QColor(Qt.white)
+        # Solid, role-based color with automatic readable text.
+        base_color = QColor(palette_for_role(shift.get("role")))
+        bg = QColor(base_color)
+        bg.setAlpha(255)
+        luminance = 0.299 * bg.red() + 0.587 * bg.green() + 0.114 * bg.blue()
+        fg = QColor(Qt.black if luminance > 150 else Qt.white)
         return bg, fg
 
     def _handle_selection_changed(self) -> None:

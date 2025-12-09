@@ -21,6 +21,7 @@ from database import (  # noqa: E402
     EmployeeBase,
     EmployeeUnavailability,
     ProjectionsBase,
+    Policy,
     Shift,
     WeekContext,
     WeekDailyProjection,
@@ -32,14 +33,19 @@ from database import (  # noqa: E402
 from data_exchange import (  # noqa: E402
     copy_week_dataset,
     export_employees,
+    export_policy_dataset,
+    export_role_wages_dataset,
     export_week_modifiers,
     export_week_projections,
     export_week_schedule,
     import_employees,
+    import_policy_dataset,
+    import_role_wages_dataset,
     import_week_modifiers,
     import_week_projections,
     import_week_schedule,
 )
+import wages  # noqa: E402
 
 
 @pytest.fixture()
@@ -76,6 +82,8 @@ def memory_db(monkeypatch, tmp_path):
 
     # Keep exports in a temp folder to avoid polluting the repo.
     monkeypatch.setattr("data_exchange.EXPORT_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(wages, "DATA_DIR", tmp_path, raising=False)
+    monkeypatch.setattr(wages, "WAGES_FILE", tmp_path / "role_wages.json", raising=False)
 
     session = Session()
     employee_session = Session()
@@ -270,3 +278,45 @@ def test_copy_week_dataset_duplicates_projections(memory_db) -> None:
     assert summary == {"projections": 7}
     assert target_rows[0].projected_sales_amount == 200.0
     assert target_rows[0].projected_notes == "carry"
+
+
+def test_role_wages_export_import_round_trip(memory_db) -> None:
+    # Seed a known wage value, export, clobber, and import back.
+    wages.reset_wages_to_defaults()
+    data = wages.load_wages()
+    data["Server - Dining"]["wage"] = 22.5
+    data["Server - Dining"]["confirmed"] = True
+    wages.save_wages(data)
+
+    export_path = export_role_wages_dataset()
+
+    corrupted = wages.load_wages()
+    corrupted["Server - Dining"]["wage"] = 0.0
+    corrupted["Server - Dining"]["confirmed"] = False
+    wages.save_wages(corrupted)
+
+    imported = import_role_wages_dataset(export_path)
+    restored = wages.load_wages()
+
+    assert imported > 0
+    assert restored["Server - Dining"]["wage"] == 22.5
+    assert restored["Server - Dining"]["confirmed"] is True
+
+
+def test_policy_export_import_round_trip(memory_db) -> None:
+    session = memory_db["session"]
+    policy_payload = {"description": "export me", "roles": {"Server": {"hourly_wage": 15}}}
+    upsert_policy = db.upsert_policy  # type: ignore[attr-defined]
+
+    upsert_policy(session, "Baseline", policy_payload, edited_by="tester")
+    export_path = export_policy_dataset(session)
+
+    session.execute(delete(Policy))
+    session.commit()
+
+    imported = import_policy_dataset(session, export_path, edited_by="tester")
+    reloaded = db.get_active_policy(session)
+
+    assert imported.name == "Baseline"
+    assert reloaded is not None
+    assert reloaded.params_dict().get("description") == "export me"

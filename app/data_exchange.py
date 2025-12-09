@@ -11,16 +11,19 @@ from database import (
     Employee,
     EmployeeUnavailability,
     Modifier,
+    Policy,
     Shift,
     WeekContext,
     get_all_weeks,
     get_or_create_week,
     get_or_create_week_context,
+    get_active_policy,
     get_week_daily_projections,
     get_week_modifiers,
     save_week_daily_projection_values,
     set_week_status,
     save_employee_role_wages,
+    upsert_policy,
 )
 from exporter import DATA_DIR as EXPORT_DIR
 from roles import defined_roles
@@ -308,6 +311,36 @@ def export_role_wages_dataset() -> Path:
 
 def import_role_wages_dataset(file_path: Path) -> int:
     return import_wages(file_path)
+
+
+# ---------------------------------------------------------------------------
+# Policy import/export
+
+
+def export_policy_dataset(session) -> Path:
+    policy = get_active_policy(session)
+    if not policy:
+        raise ValueError("No active policy found to export.")
+    payload = {
+        "name": policy.name,
+        "params": policy.params_dict(),
+    }
+    filename = EXPORT_DIR / f"policy_{_timestamp()}.json"
+    filename.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    return filename
+
+
+def import_policy_dataset(session, file_path: Path, *, edited_by: str = "import") -> Policy:
+    data = json.loads(file_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("Policy file must be a JSON object.")
+    params = data.get("params") if isinstance(data.get("params"), dict) else None
+    if params is None:
+        params = {k: v for k, v in data.items() if k != "name"}
+    params = dict(params)
+    params.pop("name", None)
+    name = data.get("name") or params.get("policy_name") or "Imported Policy"
+    return upsert_policy(session, name, params, edited_by=edited_by)
 
 
 # ---------------------------------------------------------------------------

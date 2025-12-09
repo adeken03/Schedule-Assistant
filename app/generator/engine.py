@@ -1426,6 +1426,8 @@ class ScheduleGenerator:
         dining_am_starts = _staggered_starts(am_window[0], dining_am_required)
         if not dining_am_starts:
             dining_am_starts = [am_window[0]]
+        # Force opener follow-up to start immediately at open for continuity.
+        dining_am_starts[0] = frame["open_dt"]
         # Build AM end times so early arrivals cut earlier while keeping overlap to PM.
         am_min_dur = datetime.timedelta(hours=4)
         am_overlap_floor = min(am_end_target, frame["pm_start"] + datetime.timedelta(minutes=30))
@@ -1449,8 +1451,8 @@ class ScheduleGenerator:
             day_index=day_index,
             date_value=date_value,
             section="dining",
-            allow_cut=True,
-            essential=False,
+            allow_cut=False,
+            essential=True,
             cut_rank=GLOBAL_CUT_RANKS["dining"],
             note="Dining opener follow-up",
             pair_key=dining_open_pair,
@@ -1487,6 +1489,8 @@ class ScheduleGenerator:
                 cocktail_am_ends.append(self._snap_datetime(target_end))
             for start_dt in cocktail_am_starts:
                 idx = cocktail_am_starts.index(start_dt)
+                if idx == 0:
+                    start_dt = frame["open_dt"]
                 self._add_plan_entry(
                     plans,
                     role="Server - Cocktail",
