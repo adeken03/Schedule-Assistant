@@ -230,7 +230,16 @@ def _open_close_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict
                     }
                 )
                 break
-            if loc != "close" and seg_end > close_dt:
+            role_norm = normalize_role(shift.role)
+            buffer_minutes = 0
+            try:
+                buffer_minutes = int((policy.get("global") or {}).get("close_buffer_minutes", 35) or 0)
+            except Exception:  # noqa: BLE001
+                buffer_minutes = 0
+            close_limit = close_dt
+            if "expo" in role_norm or "closer" in role_norm:
+                close_limit = close_dt + datetime.timedelta(minutes=buffer_minutes)
+            if loc != "close" and seg_end > close_limit:
                 issues.append(
                     {
                         "type": "hours",
@@ -252,11 +261,18 @@ def _demand_indices_for_week(session, week: WeekSchedule) -> Dict[int, float]:
     except Exception:  # noqa: BLE001
         return indices
     sales_values = [float(proj.projected_sales_amount or 0.0) for proj in projections]
-    max_sales = max(sales_values) if sales_values else 0.0
-    if max_sales <= 0:
-        max_sales = 1.0
+    # Absolute Rolla tiers to avoid misclassifying slow weeks as peak.
+    def _tier_value(sales: float) -> float:
+        if sales <= 5000:
+            return 0.3
+        if sales <= 9000:
+            return 0.6
+        if sales <= 12500:
+            return 0.9
+        return 1.1
     for proj in projections:
-        indices[int(proj.day_of_week)] = float(proj.projected_sales_amount or 0.0) / max_sales
+        sales = float(proj.projected_sales_amount or 0.0)
+        indices[int(proj.day_of_week)] = _tier_value(sales)
     return indices
 
 

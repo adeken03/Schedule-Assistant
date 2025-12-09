@@ -29,6 +29,11 @@ def _normalize_policy(policy: Dict) -> Dict:
     if not isinstance(policy, dict):
         return {}
     normalized = copy.deepcopy(policy)
+    # Drop legacy HOH roles we no longer schedule.
+    roles_cfg = normalized.get("roles")
+    if isinstance(roles_cfg, dict):
+        for legacy_role in ("HOH - Cook", "HOH - Prep"):
+            roles_cfg.pop(legacy_role, None)
     normalized.setdefault("section_priority", "normal")
     normalized.setdefault("hoh_mode", "auto")
     normalized.setdefault("allow_mgr_fallback", normalized.get("pre_engine", {}).get("fallback", {}).get("allow_mgr_fallback", True))
@@ -41,8 +46,21 @@ def _normalize_policy(policy: Dict) -> Dict:
     default_trim = global_defaults.get("trim_aggressive_ratio", 1.0)
     # Ensure trim_aggressive_ratio is at least the code default so budgets are not silently capped.
     global_cfg["trim_aggressive_ratio"] = max(default_trim, trim_ratio)
+    # Seasonal patio toggle: if not present, derive from the patio role's enabled state to keep UI toggles sticky.
+    seasonal_defaults = BASELINE_POLICY.get("seasonal_settings", {})
+    seasonal_cfg = normalized.setdefault("seasonal_settings", {})
+    if "server_patio_enabled" not in seasonal_cfg:
+        patio_role = role_definition(normalized, "Server - Patio")
+        patio_enabled = bool(patio_role.get("enabled", seasonal_defaults.get("server_patio_enabled", True)))
+        seasonal_cfg["server_patio_enabled"] = patio_enabled
     normalized["pre_engine"] = pre_engine_settings(normalized)
     anchors = normalized.setdefault("anchors", copy.deepcopy(ANCHOR_RULES))
+    # Strip legacy cook/prep from anchors if user stored them.
+    for key in ("opener_roles", "closer_roles"):
+        if isinstance(anchors.get(key), dict):
+            for group, roles in list(anchors[key].items()):
+                if isinstance(roles, list):
+                    anchors[key][group] = [r for r in roles if r not in {"HOH - Cook", "HOH - Prep"}]
     non_cuttable = set(anchors.get("non_cuttable_roles", []))
     for role in required_roles(normalized):
         non_cuttable.add(role)
@@ -1329,7 +1347,15 @@ ROLE_GROUP_ALLOCATIONS: Dict[str, Dict[str, Any]] = {
     "Management": {"allocation_pct": 0.0, "allow_cuts": True, "cut_buffer_minutes": 30},
 }
 
-VOLUME_THRESHOLDS_DEFAULT: Dict[str, float] = {"slow_max": 0.45, "moderate_max": 0.75, "peak_min": 0.9}
+VOLUME_THRESHOLDS_DEFAULT: Dict[str, float] = {
+    "slow_max": 0.45,
+    "moderate_max": 0.75,
+    "peak_min": 0.9,
+    # Optional absolute mode (sales-based) for dev/internal use; keep default off.
+    "use_absolute": False,
+    "slow_sales_max": 4500.0,
+    "moderate_sales_max": 8500.0,
+}
 PRE_ENGINE_DEFAULTS: Dict[str, Any] = {
     "required_roles": [
         "Bartender - Opener",

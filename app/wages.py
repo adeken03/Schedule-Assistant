@@ -28,9 +28,10 @@ def baseline_wages() -> Dict[str, Dict[str, Any]]:
         spec = roles.get(role) if isinstance(roles, dict) else {}
         wage = float(spec.get("hourly_wage", 0.0) if isinstance(spec, dict) else 0.0)
         normalized = normalize_role(role)
+        default_confirmed = normalized in ALLOW_ZERO_ROLES or wage > 0
         payload[role] = {
             "wage": round(max(0.0, wage), 2),
-            "confirmed": normalized in ALLOW_ZERO_ROLES,
+            "confirmed": default_confirmed,
         }
     return payload
 
@@ -55,7 +56,9 @@ def load_wages() -> Dict[str, Dict[str, Any]]:
         if "wage" not in entry:
             entry["wage"] = default["wage"]
         if "confirmed" not in entry:
-            entry["confirmed"] = False
+            entry["confirmed"] = default["confirmed"]
+        else:
+            entry["confirmed"] = bool(entry["confirmed"] or default["confirmed"])
     return data
 
 
@@ -123,7 +126,11 @@ def import_wages(source: Path) -> int:
             except (TypeError, ValueError):
                 pass
         if "confirmed" in entry:
-            record["confirmed"] = bool(entry["confirmed"]) or normalize_role(role) in ALLOW_ZERO_ROLES
+            record["confirmed"] = (
+                bool(entry["confirmed"])
+                or normalize_role(role) in ALLOW_ZERO_ROLES
+                or record.get("wage", 0) > 0
+            )
         count += 1
     save_wages(normalized)
     return count

@@ -3339,12 +3339,17 @@ class PolicyComposerDialog(QDialog):
         self.shift_template_editor.set_config(self.policy_payload.get("shift_presets", {}))
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
         self.section_capacity_editor.set_config(self.policy_payload.get("section_capacity", {}))
+
         seasonal_settings = self.policy_payload.get("seasonal_settings", {})
-        seasonal_box = QGroupBox("Seasonal options")
-        seasonal_layout = QVBoxLayout(seasonal_box)
-        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
-        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
-        seasonal_layout.addWidget(self.patio_toggle)
+        self.patio_toggle = self._make_toggle_button(
+            "Patio open (Patio ENABLED)",
+            bool(seasonal_settings.get("server_patio_enabled", True)),
+        )
+        fallback_cfg = self.policy_payload.get("fallback", {})
+        self.fallback_allow_mgr = self._make_toggle_button(
+            "Allow emergency manager coverage",
+            bool(fallback_cfg.get("allow_mgr_fallback", True)),
+        )
 
         intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
         intro.setWordWrap(True)
@@ -4045,18 +4050,46 @@ class PolicyDialog(QDialog):
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
         layout.addWidget(self.section_capacity_editor)
         seasonal_settings = self.policy_data.get("seasonal_settings", {})
-        seasonal_box = QGroupBox("Seasonal options")
-        seasonal_layout = QVBoxLayout(seasonal_box)
-        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
-        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
-        seasonal_layout.addWidget(self.patio_toggle)
-        layout.addWidget(seasonal_box)
+        fallback_cfg = self.policy_data.get("fallback", {})
+        # Reuse the patio toggle if it was already constructed; ensures a single source of truth.
+        if not hasattr(self, "patio_toggle"):
+            self.patio_toggle = self._make_toggle_button(
+                "Patio open (Toggle on/off)",
+                bool(seasonal_settings.get("server_patio_enabled", True)),
+            )
+        self.fallback_allow_mgr = self._make_toggle_button(
+            "Allow emergency manager coverage",
+            bool(fallback_cfg.get("allow_mgr_fallback", True)),
+        )
         self._build_pre_engine_section(layout)
         self.migration_notice = QLabel("Some deprecated settings were removed or converted automatically.")
         self.migration_notice.setStyleSheet(f"color:{INFO_COLOR};")
         self.migration_notice.setWordWrap(True)
         self.migration_notice.setVisible(False)
         layout.addWidget(self.migration_notice)
+        button_row = QHBoxLayout()
+        button_row.setSpacing(12)
+        button_row.addStretch(1)
+        seasonal_settings = self.policy_data.get("seasonal_settings", {})
+        fallback_cfg = self.policy_data.get("fallback", {})
+        # Reuse the single patio toggle (built earlier) so saved state matches the UI.
+        if not hasattr(self, "patio_toggle"):
+            self.patio_toggle = self._make_toggle_button(
+                "Toggle Patio - On is open",
+                bool(seasonal_settings.get("server_patio_enabled", True)),
+            )
+        self.patio_toggle.setMinimumWidth(220)
+        self.patio_toggle.setMaximumWidth(320)
+        button_row.addWidget(self.patio_toggle)
+        self.fallback_allow_mgr = self._make_toggle_button(
+            "Allow emergency manager coverage",
+            bool(fallback_cfg.get("allow_mgr_fallback", True)),
+        )
+        self.fallback_allow_mgr.setMinimumWidth(220)
+        self.fallback_allow_mgr.setMaximumWidth(320)
+        button_row.addWidget(self.fallback_allow_mgr)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
@@ -4170,6 +4203,11 @@ class PolicyDialog(QDialog):
             self.section_priority_combo.setCurrentIndex(idx)
         else:
             self.section_priority_combo.setCurrentIndex(0)
+        # Seasonal / fallback toggles reflect loaded policy.
+        seasonal_settings = self.policy_data.get("seasonal_settings", {})
+        fallback_cfg = self.policy_data.get("fallback", {})
+        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
+        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
         self._handle_section_priority_change()
 
     def _sync_desired_range_bounds(self) -> None:
@@ -4399,13 +4437,6 @@ class PolicyDialog(QDialog):
         hoh_form.addRow("HOH staffing mode", self.hoh_mode_combo)
         outer.addWidget(hoh_box)
 
-        fallback_box = QGroupBox("Fallback & budget")
-        fallback_form = QFormLayout(fallback_box)
-        self.fallback_allow_mgr = QCheckBox("Allow emergency manager coverage")
-        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
-        fallback_form.addRow(self.fallback_allow_mgr)
-        outer.addWidget(fallback_box)
-
         layout.addWidget(box)
         PolicyComposerDialog._disable_scroll_wheel(
             [
@@ -4432,6 +4463,27 @@ class PolicyDialog(QDialog):
         layout.addWidget(QLabel("/"))
         layout.addWidget(second)
         return wrapper
+
+    @staticmethod
+    @staticmethod
+    def _make_toggle_button(label: str, checked: bool) -> QPushButton:
+        button = QPushButton()
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setMinimumHeight(34)
+
+        def _restyle() -> None:
+            on = button.isChecked()
+            button.setText(f"{label} ({'On' if on else 'Off'})")
+            button.setStyleSheet(
+                "QPushButton {padding:8px 14px; font-weight:600; border-radius:8px; border:1px solid #2d2d2d;}"
+                f"QPushButton {{ background-color:{'#2e7d32' if on else '#3a3a3a'}; color:white; }}"
+            )
+
+        button.toggled.connect(_restyle)
+        _restyle()
+        return button
     def _read_role_groups(self) -> Dict[str, Dict[str, Any]]:
         payload: Dict[str, Dict[str, Any]] = {}
         existing = self.policy_data.get("role_groups", {})
@@ -4452,6 +4504,17 @@ class PolicyDialog(QDialog):
         self.policy_data["section_priority"] = self.section_priority_combo.currentData()
         self.policy_data["hoh_mode"] = self.hoh_mode_combo.currentData()
         self.policy_data["allow_mgr_fallback"] = self.fallback_allow_mgr.isChecked()
+        # Keep seasonal/fallback toggles in sync with saved payload.
+        seasonal_settings = self.policy_data.get("seasonal_settings", {}) or {}
+        seasonal_settings["server_patio_enabled"] = bool(self.patio_toggle.isChecked())
+        self.policy_data["seasonal_settings"] = seasonal_settings
+        fallback_cfg = self.policy_data.get("fallback", {}) or {}
+        fallback_cfg["allow_mgr_fallback"] = bool(self.fallback_allow_mgr.isChecked())
+        self.policy_data["fallback"] = fallback_cfg
+        # Mirror patio toggle into the patio role enabled flag.
+        patio_role = self.policy_data.get("roles", {}).get("Server - Patio", {})
+        if isinstance(patio_role, dict):
+            patio_role["enabled"] = bool(seasonal_settings["server_patio_enabled"])
         params: Dict[str, Any] = {
             "name": name,
             "description": description,
@@ -4573,12 +4636,17 @@ class PolicyDialog(QDialog):
     
     def _ensure_policy_defaults(self) -> None:
         defaults = build_default_policy()
-        self.policy_data.setdefault("roles", defaults.get("roles", {}))
-        self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
+        roles = self.policy_data.setdefault("roles", {})
+        for role_name, cfg in (defaults.get("roles") or {}).items():
+            roles.setdefault(role_name, cfg)
+        groups = self.policy_data.setdefault("role_groups", {})
+        for group_name, cfg in (defaults.get("role_groups") or {}).items():
+            groups.setdefault(group_name, cfg)
         anchors_defaults = defaults.get("anchors", {})
         self.policy_data.setdefault("anchors", anchors_defaults.copy())
         self.policy_data.setdefault("shift_presets", defaults.get("shift_presets", {}))
         self.policy_data.setdefault("section_capacity", defaults.get("section_capacity", {}))
+        self.policy_data.setdefault("seasonal_settings", defaults.get("seasonal_settings", {}))
         self.policy_data.setdefault("pre_engine", pre_engine_settings(self.policy_data))
         self.policy_data.setdefault("section_priority", defaults.get("section_priority", "normal"))
         self.policy_data.setdefault("hoh_mode", defaults.get("hoh_mode", "auto"))

@@ -796,7 +796,16 @@ class WeekSchedulePage(QWidget):
                 "Add active employees from Week Prep → Employee directory before generating a schedule.",
             )
             return False
-        roles_needed = sorted({role for entry in employees for role in entry.get("roles", []) if role})
+        # Only validate wages for roles that are still present in the active policy.
+        active_roles = set(role_catalog(self.policy))
+        roles_needed = sorted(
+            {
+                role
+                for entry in employees
+                for role in entry.get("roles", [])
+                if role and role in active_roles
+            }
+        )
         if not roles_needed:
             QMessageBox.warning(
                 self,
