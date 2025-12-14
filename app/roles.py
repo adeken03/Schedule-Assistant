@@ -49,11 +49,11 @@ ROLE_GROUPS: Dict[str, List[str]] = {
 }
 
 ROLE_COLORS: Dict[str, str] = {
-    "Kitchen": "#2f3a4f",
-    "Servers": "#1c4641",
-    "Bartenders": "#4a1f43",
-    "Cashier": "#4a3a1f",
-    "Management": "#313c57",
+    "Kitchen": "#2f2f33",      # HOH steel grey
+    "Servers": "#1f3b70",      # FOH royal blue
+    "Bartenders": "#8b4a2b",   # Aged bourbon amber
+    "Cashier": "#2e5939",      # Money green
+    "Management": "#7d0000",   # Escalation red
     "Other": "#2f2f2f",
 }
 

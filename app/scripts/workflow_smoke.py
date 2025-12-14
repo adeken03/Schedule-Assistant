@@ -24,6 +24,7 @@ from database import (  # noqa: E402
     get_or_create_week,
     get_shifts_for_week,
     get_week_summary,
+    init_database,
     list_employees,
     save_week_daily_projection_values,
     set_week_status,
@@ -228,6 +229,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    init_database()
     args = parse_args()
     if args.week_start:
         try:

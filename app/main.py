@@ -11,6 +11,10 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
+APP_DIR = Path(__file__).resolve().parent
+if str(APP_DIR) not in sys.path:
+    sys.path.insert(0, str(APP_DIR))
+
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
@@ -99,7 +103,16 @@ from data_exchange import (
     import_week_projections,
     import_week_schedule,
 )
-from policy import CUT_PRIORITY_DEFAULT, build_default_policy, ensure_default_policy, role_catalog, pre_engine_settings
+from policy import (
+    CUT_PRIORITY_DEFAULT,
+    DEFAULT_ENGINE_TUNING,
+    build_default_policy,
+    ensure_default_policy,
+    pre_engine_settings,
+    resolve_fallback_limits,
+    resolve_hoh_thresholds,
+    role_catalog,
+)
 from wages import (
     baseline_wages,
     export_wages as export_wages_file,
@@ -112,9 +125,12 @@ from wages import (
 )
 from roles import ROLE_GROUPS, role_group, normalize_role
 from ui.week_view import WeekSchedulePage
+from ui.backup_dialog import BackupManagerDialog
+from backup import auto_backup_on_startup, cleanup_old_auto_backups
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 ICON_FILE = Path(__file__).resolve().parents[1] / "project_image.ico"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 AUDIT_FILE = DATA_DIR / "audit.log"
@@ -3329,12 +3345,18 @@ class PolicyComposerDialog(QDialog):
         self.shift_template_editor.set_config(self.policy_payload.get("shift_presets", {}))
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
         self.section_capacity_editor.set_config(self.policy_payload.get("section_capacity", {}))
+
         seasonal_settings = self.policy_payload.get("seasonal_settings", {})
-        seasonal_box = QGroupBox("Seasonal options")
-        seasonal_layout = QVBoxLayout(seasonal_box)
-        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
-        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
-        seasonal_layout.addWidget(self.patio_toggle)
+        self.patio_toggle = self._make_toggle_button(
+            "Patio open (Patio ENABLED)",
+            bool(seasonal_settings.get("server_patio_enabled", True)),
+        )
+        pre_engine_cfg = pre_engine_settings(self.policy_payload)
+        fallback_cfg = pre_engine_cfg.get("fallback", {}) if isinstance(pre_engine_cfg, dict) else {}
+        self.fallback_allow_mgr = self._make_toggle_button(
+            "Allow emergency manager coverage",
+            bool(fallback_cfg.get("allow_mgr_fallback", True)),
+        )
 
         intro = QLabel("Set the rules the generator should follow. These values are intended for the GM and act like store-wide scheduling settings.")
         intro.setWordWrap(True)
@@ -3892,8 +3914,18 @@ class PolicyComposerDialog(QDialog):
         if patio_role is not None:
             patio_role["enabled"] = bool(seasonal_payload["server_patio_enabled"])
         self.policy_payload["section_capacity"] = self.section_capacity_editor.value()
+        allow_mgr_fallback = bool(self.fallback_allow_mgr.isChecked()) if hasattr(self, "fallback_allow_mgr") else True
+        pre_engine_payload = pre_engine_settings({**self.policy_payload, "allow_mgr_fallback": allow_mgr_fallback})
+        if isinstance(pre_engine_payload, dict):
+            limits = resolve_fallback_limits({"allow_mgr_fallback": allow_mgr_fallback})
+            fallback_payload = pre_engine_payload.setdefault("fallback", {})
+            if isinstance(fallback_payload, dict):
+                fallback_payload["allow_mgr_fallback"] = allow_mgr_fallback
+                fallback_payload["am_limit"] = limits.get("am", 1)
+                fallback_payload["pm_limit"] = limits.get("pm", 1)
         params = {
             "description": self.policy_payload.get("description", ""),
+            "allow_mgr_fallback": allow_mgr_fallback,
             "global": self.policy_payload["global"],
             "timeblocks": {
                 row["name"]: {"start": row["start"], "end": row["end"]} for row in self.policy_payload["timeblocks"]
@@ -3904,7 +3936,7 @@ class PolicyComposerDialog(QDialog):
             "shift_presets": self.policy_payload.get("shift_presets", {}),
             "section_capacity": self.policy_payload.get("section_capacity", {}),
             "anchors": self.policy_payload.get("anchors", {}),
-            "pre_engine": self.policy_payload.get("pre_engine", pre_engine_settings(self.policy_payload)),
+            "pre_engine": pre_engine_payload,
         }
         self.result_data = {"name": name, "params": params}
         super().accept()
@@ -4022,15 +4054,34 @@ class PolicyDialog(QDialog):
         self.shift_template_editor = ShiftTemplateEditor(["Servers", "Kitchen", "Cashier"])
         layout.addWidget(self.shift_template_editor)
         self.section_capacity_editor = SectionCapacityEditor({"Servers": ["Dining", "Patio", "Cocktail"]})
+        self.section_capacity_editor.setVisible(False)
         layout.addWidget(self.section_capacity_editor)
-        seasonal_settings = self.policy_data.get("seasonal_settings", {})
-        seasonal_box = QGroupBox("Seasonal options")
-        seasonal_layout = QVBoxLayout(seasonal_box)
-        self.patio_toggle = QCheckBox("Patio open (Server - Patio role enabled)")
-        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
-        seasonal_layout.addWidget(self.patio_toggle)
-        layout.addWidget(seasonal_box)
         self._build_pre_engine_section(layout)
+        self.migration_notice = QLabel("Some deprecated settings were removed or converted automatically.")
+        self.migration_notice.setStyleSheet(f"color:{INFO_COLOR};")
+        self.migration_notice.setWordWrap(True)
+        self.migration_notice.setVisible(False)
+        layout.addWidget(self.migration_notice)
+        button_row = QHBoxLayout()
+        button_row.setSpacing(12)
+        button_row.addStretch(1)
+        seasonal_settings = self.policy_data.get("seasonal_settings", {})
+        self.patio_toggle = self._make_toggle_button(
+            "Patio open (Toggle on/off)",
+            bool(seasonal_settings.get("server_patio_enabled", True)),
+        )
+        self.patio_toggle.setMinimumWidth(220)
+        self.patio_toggle.setMaximumWidth(320)
+        button_row.addWidget(self.patio_toggle)
+        self.fallback_allow_mgr = self._make_toggle_button(
+            "Allow emergency manager coverage",
+            bool(self.policy_data.get("allow_mgr_fallback", True)),
+        )
+        self.fallback_allow_mgr.setMinimumWidth(220)
+        self.fallback_allow_mgr.setMaximumWidth(320)
+        button_row.addWidget(self.fallback_allow_mgr)
+        button_row.addStretch(1)
+        layout.addLayout(button_row)
 
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet(f"color:{INFO_COLOR};")
@@ -4085,25 +4136,14 @@ class PolicyDialog(QDialog):
                 self.dining_slow_max_spin,
                 self.dining_moderate_spin,
                 self.dining_peak_spin,
-                self.dining_manual_spin,
-                self.server_opener_spin,
                 self.cocktail_normal_spin,
                 self.cocktail_busy_spin,
                 self.cocktail_peak_spin,
-                self.cocktail_manual_spin,
                 self.cashier_am_spin,
                 self.cashier_pm_spin,
                 self.cashier_busy_spin,
                 self.cashier_peak_spin,
-                self.cashier_manual_spin,
-                self.hoh_low_spin,
-                self.hoh_split_spin,
-                self.hoh_peak_spin,
                 self.fallback_allow_mgr,
-                self.fallback_am_limit,
-                self.fallback_pm_limit,
-                self.budget_mode_combo,
-                self.budget_tolerance_spin,
             ]:
                 widget.setEnabled(False)
             self.save_button.setEnabled(False)
@@ -4149,6 +4189,14 @@ class PolicyDialog(QDialog):
         self._populate_role_groups()
         self._apply_pre_engine_values()
         self._populate_role_groups()
+        # Seasonal / fallback toggles reflect loaded policy.
+        seasonal_settings = self.policy_data.get("seasonal_settings", {})
+        self.patio_toggle.setChecked(bool(seasonal_settings.get("server_patio_enabled", True)))
+        pre_engine_cfg = pre_engine_settings(self.policy_data)
+        fallback_cfg = pre_engine_cfg.get("fallback", {}) if isinstance(pre_engine_cfg, dict) else {}
+        allow_mgr_fallback = bool(fallback_cfg.get("allow_mgr_fallback", True))
+        self.policy_data["allow_mgr_fallback"] = allow_mgr_fallback
+        self.fallback_allow_mgr.setChecked(allow_mgr_fallback)
 
     def _sync_desired_range_bounds(self) -> None:
         if self.desired_ceiling_spin.value() < self.desired_floor_spin.value():
@@ -4194,32 +4242,19 @@ class PolicyDialog(QDialog):
         self.dining_slow_max_spin.setValue(int(dining_cfg.get("slow_max", 4)))
         self.dining_moderate_spin.setValue(int(dining_cfg.get("moderate", 5)))
         self.dining_peak_spin.setValue(int(dining_cfg.get("peak", 6)))
-        self.dining_manual_spin.setValue(int(dining_cfg.get("manual_max", 7)))
-        self.server_opener_spin.setValue(int(server_cfg.get("opener_count", 1)))
         self.cocktail_normal_spin.setValue(int(cocktail_cfg.get("normal", 2)))
         self.cocktail_busy_spin.setValue(int(cocktail_cfg.get("busy", 3)))
         self.cocktail_peak_spin.setValue(int(cocktail_cfg.get("peak", 4)))
-        self.cocktail_manual_spin.setValue(int(cocktail_cfg.get("manual_max", 4)))
         self.cashier_am_spin.setValue(int(cashier_cfg.get("am_default", 1)))
         self.cashier_pm_spin.setValue(int(cashier_cfg.get("pm_default", 1)))
         self.cashier_busy_spin.setValue(int(cashier_cfg.get("busy_split", 2)))
         self.cashier_peak_spin.setValue(int(cashier_cfg.get("peak", 3)))
-        self.cashier_manual_spin.setValue(int(cashier_cfg.get("manual_max", 4)))
-        thresholds = hoh_cfg.get("combo_thresholds", {})
-        self.hoh_low_spin.setValue(float(thresholds.get("low_max", 0.55)))
-        self.hoh_split_spin.setValue(float(thresholds.get("split_min", 0.75)))
-        self.hoh_peak_spin.setValue(float(thresholds.get("peak_min", 1.0)))
-        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
-        self.fallback_am_limit.setValue(int(fallback_cfg.get("am_limit", 1)))
-        self.fallback_pm_limit.setValue(int(fallback_cfg.get("pm_limit", 1)))
-        budget_tolerance = float(budget_cfg.get("tolerance_pct", 8.0) or 0.0)
-        if budget_tolerance <= 1:
-            budget_tolerance *= 100
-        self.budget_tolerance_spin.setValue(budget_tolerance)
-        mode_value = str(budget_cfg.get("mode", "adaptive")).lower()
-        idx = self.budget_mode_combo.findData(mode_value if mode_value in {"adaptive", "strict"} else "adaptive")
+        mode_value = (self.policy_data.get("hoh_mode") or "auto").lower()
+        idx = self.hoh_mode_combo.findData(mode_value if mode_value in {"auto", "combo", "split", "peak"} else "auto")
         if idx >= 0:
-            self.budget_mode_combo.setCurrentIndex(idx)
+            self.hoh_mode_combo.setCurrentIndex(idx)
+        else:
+            self.hoh_mode_combo.setCurrentIndex(0)
 
     def _read_pre_engine_controls(self) -> Dict[str, Any]:
         cfg = pre_engine_settings(self.policy_data)
@@ -4228,49 +4263,44 @@ class PolicyDialog(QDialog):
         budget_cfg = budget_cfg_raw if isinstance(budget_cfg_raw, dict) else {}
         payload = copy.deepcopy(cfg)
         payload.setdefault("staffing", {})
+        dining_cfg = staffing.get("servers", {}).get("dining", {})
+        cocktail_cfg = staffing.get("servers", {}).get("cocktail", {})
         payload["staffing"]["servers"] = {
             "dining": {
                 "slow_min": self.dining_slow_min_spin.value(),
                 "slow_max": self.dining_slow_max_spin.value(),
                 "moderate": self.dining_moderate_spin.value(),
                 "peak": self.dining_peak_spin.value(),
-                "manual_max": self.dining_manual_spin.value(),
+                "manual_max": dining_cfg.get("manual_max", 7),
             },
             "cocktail": {
                 "normal": self.cocktail_normal_spin.value(),
                 "busy": self.cocktail_busy_spin.value(),
                 "peak": self.cocktail_peak_spin.value(),
-                "manual_max": self.cocktail_manual_spin.value(),
+                "manual_max": cocktail_cfg.get("manual_max", 4),
             },
-            "opener_count": self.server_opener_spin.value(),
+            "opener_count": staffing.get("servers", {}).get("opener_count", 1),
         }
         payload["staffing"]["cashier"] = {
             "am_default": self.cashier_am_spin.value(),
             "pm_default": self.cashier_pm_spin.value(),
             "busy_split": self.cashier_busy_spin.value(),
             "peak": self.cashier_peak_spin.value(),
-            "manual_max": self.cashier_manual_spin.value(),
+            "manual_max": staffing.get("cashier", {}).get("manual_max", 4),
         }
         payload["staffing"]["hoh"] = {
-            "combo_thresholds": {
-                "low_max": round(self.hoh_low_spin.value(), 2),
-                "split_min": round(self.hoh_split_spin.value(), 2),
-                "peak_min": round(self.hoh_peak_spin.value(), 2),
-            },
+            "combo_thresholds": resolve_hoh_thresholds(self.policy_data),
             **{k: v for k, v in staffing.get("hoh", {}).items() if k not in {"combo_thresholds"}},
         }
+        limits = resolve_fallback_limits({"allow_mgr_fallback": self.fallback_allow_mgr.isChecked()})
         payload["fallback"] = {
             "allow_mgr_fallback": self.fallback_allow_mgr.isChecked(),
-            "am_limit": self.fallback_am_limit.value(),
-            "pm_limit": self.fallback_pm_limit.value(),
-            "tag": cfg.get("fallback", {}).get("tag", "MANAGER COVERING — REVIEW REQUIRED"),
+            "am_limit": limits.get("am", 1),
+            "pm_limit": limits.get("pm", 1),
+            "tag": cfg.get("fallback", {}).get("tag", "MANAGER COVERING ? REVIEW REQUIRED"),
             "disallow_roles": cfg.get("fallback", {}).get("disallow_roles", []),
         }
-        payload["budget"] = {
-            **budget_cfg,
-            "mode": self.budget_mode_combo.currentData(),
-            "tolerance_pct": round(self.budget_tolerance_spin.value(), 2),
-        }
+        payload["budget"] = budget_cfg
         return payload
 
     def _build_timeblocks(self) -> Dict[str, Dict[str, str]]:
@@ -4335,17 +4365,9 @@ class PolicyDialog(QDialog):
         self.dining_peak_spin = QSpinBox()
         self.dining_peak_spin.setRange(0, 30)
         self.dining_peak_spin.setValue(int(dining_cfg.get("peak", 6)))
-        self.dining_manual_spin = QSpinBox()
-        self.dining_manual_spin.setRange(0, 40)
-        self.dining_manual_spin.setValue(int(dining_cfg.get("manual_max", 7)))
-        self.server_opener_spin = QSpinBox()
-        self.server_opener_spin.setRange(0, 5)
-        self.server_opener_spin.setValue(int(server_cfg.get("opener_count", 1)))
         server_form.addRow("Dining slow (min/max)", self._paired_spin(self.dining_slow_min_spin, self.dining_slow_max_spin))
         server_form.addRow("Dining moderate", self.dining_moderate_spin)
         server_form.addRow("Dining peak", self.dining_peak_spin)
-        server_form.addRow("Dining manual override >", self.dining_manual_spin)
-        server_form.addRow("Server opener count", self.server_opener_spin)
 
         self.cocktail_normal_spin = QSpinBox()
         self.cocktail_normal_spin.setRange(0, 20)
@@ -4356,12 +4378,8 @@ class PolicyDialog(QDialog):
         self.cocktail_peak_spin = QSpinBox()
         self.cocktail_peak_spin.setRange(0, 20)
         self.cocktail_peak_spin.setValue(int(cocktail_cfg.get("peak", 4)))
-        self.cocktail_manual_spin = QSpinBox()
-        self.cocktail_manual_spin.setRange(0, 30)
-        self.cocktail_manual_spin.setValue(int(cocktail_cfg.get("manual_max", 4)))
         server_form.addRow("Cocktail normal/busy", self._paired_spin(self.cocktail_normal_spin, self.cocktail_busy_spin))
         server_form.addRow("Cocktail peak", self.cocktail_peak_spin)
-        server_form.addRow("Cocktail manual override >", self.cocktail_manual_spin)
         outer.addWidget(server_box)
 
         cashier_box = QGroupBox("Cashier")
@@ -4378,67 +4396,21 @@ class PolicyDialog(QDialog):
         self.cashier_peak_spin = QSpinBox()
         self.cashier_peak_spin.setRange(0, 6)
         self.cashier_peak_spin.setValue(int(cashier_cfg.get("peak", 3)))
-        self.cashier_manual_spin = QSpinBox()
-        self.cashier_manual_spin.setRange(0, 8)
-        self.cashier_manual_spin.setValue(int(cashier_cfg.get("manual_max", 4)))
         cashier_form.addRow("AM cashiers", self.cashier_am_spin)
         cashier_form.addRow("PM cashiers", self.cashier_pm_spin)
         cashier_form.addRow("Busy split (To-Go + Host)", self.cashier_busy_spin)
         cashier_form.addRow("Peak cashiers", self.cashier_peak_spin)
-        cashier_form.addRow("Manual override >", self.cashier_manual_spin)
         outer.addWidget(cashier_box)
 
         hoh_box = QGroupBox("HOH (Heart of House)")
         hoh_form = QFormLayout(hoh_box)
-        thresholds = hoh_cfg.get("combo_thresholds", {})
-        self.hoh_low_spin = QDoubleSpinBox()
-        self.hoh_low_spin.setDecimals(2)
-        self.hoh_low_spin.setRange(0.0, 3.0)
-        self.hoh_low_spin.setValue(float(thresholds.get("low_max", 0.55)))
-        self.hoh_split_spin = QDoubleSpinBox()
-        self.hoh_split_spin.setDecimals(2)
-        self.hoh_split_spin.setRange(0.0, 3.0)
-        self.hoh_split_spin.setValue(float(thresholds.get("split_min", 0.75)))
-        self.hoh_peak_spin = QDoubleSpinBox()
-        self.hoh_peak_spin.setDecimals(2)
-        self.hoh_peak_spin.setRange(0.0, 3.0)
-        self.hoh_peak_spin.setValue(float(thresholds.get("peak_min", 1.0)))
-        hoh_form.addRow("Combo enabled ≤ demand", self.hoh_low_spin)
-        hoh_form.addRow("Split threshold", self.hoh_split_spin)
-        hoh_form.addRow("Peak threshold", self.hoh_peak_spin)
+        self.hoh_mode_combo = QComboBox()
+        self.hoh_mode_combo.addItem("Auto (recommended)", "auto")
+        self.hoh_mode_combo.addItem("Combo preferred", "combo")
+        self.hoh_mode_combo.addItem("Split preferred", "split")
+        self.hoh_mode_combo.addItem("Peak mode", "peak")
+        hoh_form.addRow("HOH staffing mode", self.hoh_mode_combo)
         outer.addWidget(hoh_box)
-
-        fallback_box = QGroupBox("Fallback & budget")
-        fallback_form = QFormLayout(fallback_box)
-        self.fallback_allow_mgr = QCheckBox("Allow MGR–FOH fallback")
-        self.fallback_allow_mgr.setChecked(bool(fallback_cfg.get("allow_mgr_fallback", True)))
-        self.fallback_am_limit = QSpinBox()
-        self.fallback_am_limit.setRange(0, 3)
-        self.fallback_am_limit.setValue(int(fallback_cfg.get("am_limit", 1)))
-        self.fallback_pm_limit = QSpinBox()
-        self.fallback_pm_limit.setRange(0, 3)
-        self.fallback_pm_limit.setValue(int(fallback_cfg.get("pm_limit", 1)))
-        self.budget_mode_combo = QComboBox()
-        self.budget_mode_combo.addItem("Adaptive", "adaptive")
-        self.budget_mode_combo.addItem("Strict", "strict")
-        mode_value = str(budget_cfg.get("mode", "adaptive")).lower()
-        idx = self.budget_mode_combo.findData(mode_value if mode_value in {"adaptive", "strict"} else "adaptive")
-        if idx >= 0:
-            self.budget_mode_combo.setCurrentIndex(idx)
-        self.budget_tolerance_spin = QDoubleSpinBox()
-        self.budget_tolerance_spin.setRange(0.0, 50.0)
-        self.budget_tolerance_spin.setDecimals(1)
-        self.budget_tolerance_spin.setSuffix("%")
-        budget_tolerance = float(budget_cfg.get("tolerance_pct", 8.0) or 0.0)
-        if budget_tolerance <= 1:
-            budget_tolerance *= 100
-        self.budget_tolerance_spin.setValue(budget_tolerance)
-        fallback_form.addRow(self.fallback_allow_mgr)
-        fallback_form.addRow("AM fallback limit", self.fallback_am_limit)
-        fallback_form.addRow("PM fallback limit", self.fallback_pm_limit)
-        fallback_form.addRow("Budget mode", self.budget_mode_combo)
-        fallback_form.addRow("Budget tolerance (±%)", self.budget_tolerance_spin)
-        outer.addWidget(fallback_box)
 
         layout.addWidget(box)
         PolicyComposerDialog._disable_scroll_wheel(
@@ -4447,23 +4419,13 @@ class PolicyDialog(QDialog):
                 self.dining_slow_max_spin,
                 self.dining_moderate_spin,
                 self.dining_peak_spin,
-                self.dining_manual_spin,
-                self.server_opener_spin,
                 self.cocktail_normal_spin,
                 self.cocktail_busy_spin,
                 self.cocktail_peak_spin,
-                self.cocktail_manual_spin,
                 self.cashier_am_spin,
                 self.cashier_pm_spin,
                 self.cashier_busy_spin,
                 self.cashier_peak_spin,
-                self.cashier_manual_spin,
-                self.hoh_low_spin,
-                self.hoh_split_spin,
-                self.hoh_peak_spin,
-                self.fallback_am_limit,
-                self.fallback_pm_limit,
-                self.budget_tolerance_spin,
             ]
         )
 
@@ -4476,6 +4438,27 @@ class PolicyDialog(QDialog):
         layout.addWidget(QLabel("/"))
         layout.addWidget(second)
         return wrapper
+
+    @staticmethod
+    @staticmethod
+    def _make_toggle_button(label: str, checked: bool) -> QPushButton:
+        button = QPushButton()
+        button.setCheckable(True)
+        button.setChecked(checked)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setMinimumHeight(34)
+
+        def _restyle() -> None:
+            on = button.isChecked()
+            button.setText(f"{label} ({'On' if on else 'Off'})")
+            button.setStyleSheet(
+                "QPushButton {padding:8px 14px; font-weight:600; border-radius:8px; border:1px solid #2d2d2d;}"
+                f"QPushButton {{ background-color:{'#2e7d32' if on else '#3a3a3a'}; color:white; }}"
+            )
+
+        button.toggled.connect(_restyle)
+        _restyle()
+        return button
     def _read_role_groups(self) -> Dict[str, Dict[str, Any]]:
         payload: Dict[str, Dict[str, Any]] = {}
         existing = self.policy_data.get("role_groups", {})
@@ -4493,9 +4476,21 @@ class PolicyDialog(QDialog):
     def _collect_policy_payload(self) -> Dict[str, Any]:
         name = self.name_input.text().strip() or "Store policy"
         description = self.description_input.text().strip()
+        self.policy_data["hoh_mode"] = self.hoh_mode_combo.currentData()
+        self.policy_data["allow_mgr_fallback"] = self.fallback_allow_mgr.isChecked()
+        # Keep seasonal/fallback toggles in sync with saved payload.
+        seasonal_settings = self.policy_data.get("seasonal_settings", {}) or {}
+        seasonal_settings["server_patio_enabled"] = bool(self.patio_toggle.isChecked())
+        self.policy_data["seasonal_settings"] = seasonal_settings
+        # Mirror patio toggle into the patio role enabled flag.
+        patio_role = self.policy_data.get("roles", {}).get("Server - Patio", {})
+        if isinstance(patio_role, dict):
+            patio_role["enabled"] = bool(seasonal_settings["server_patio_enabled"])
         params: Dict[str, Any] = {
             "name": name,
             "description": description,
+            "hoh_mode": self.hoh_mode_combo.currentData(),
+            "allow_mgr_fallback": self.fallback_allow_mgr.isChecked(),
             "global": {
                 "max_hours_week": self.max_hours_spin.value(),
                 "max_consecutive_days": self.max_consec_spin.value(),
@@ -4570,6 +4565,10 @@ class PolicyDialog(QDialog):
             data = json.loads(Path(file_path).read_text(encoding="utf-8"))
             if not isinstance(data, dict):
                 raise ValueError("Invalid policy file.")
+            if isinstance(data.get("params"), dict):
+                params = dict(data["params"])
+                params.setdefault("name", data.get("name") or params.get("policy_name") or "Imported Policy")
+                data = params
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Import failed", str(exc))
             return
@@ -4611,13 +4610,21 @@ class PolicyDialog(QDialog):
     
     def _ensure_policy_defaults(self) -> None:
         defaults = build_default_policy()
-        self.policy_data.setdefault("roles", defaults.get("roles", {}))
-        self.policy_data.setdefault("role_groups", defaults.get("role_groups", {}))
+        roles = self.policy_data.setdefault("roles", {})
+        for role_name, cfg in (defaults.get("roles") or {}).items():
+            roles.setdefault(role_name, cfg)
+        groups = self.policy_data.setdefault("role_groups", {})
+        for group_name, cfg in (defaults.get("role_groups") or {}).items():
+            groups.setdefault(group_name, cfg)
         anchors_defaults = defaults.get("anchors", {})
         self.policy_data.setdefault("anchors", anchors_defaults.copy())
         self.policy_data.setdefault("shift_presets", defaults.get("shift_presets", {}))
         self.policy_data.setdefault("section_capacity", defaults.get("section_capacity", {}))
+        self.policy_data.setdefault("seasonal_settings", defaults.get("seasonal_settings", {}))
         self.policy_data.setdefault("pre_engine", pre_engine_settings(self.policy_data))
+        self.policy_data.setdefault("section_priority", defaults.get("section_priority", "normal"))
+        self.policy_data.setdefault("hoh_mode", defaults.get("hoh_mode", "auto"))
+        self.policy_data.setdefault("allow_mgr_fallback", defaults.get("allow_mgr_fallback", True))
         hours = self.policy_data.setdefault("business_hours", defaults.get("business_hours", _default_business_hours()))
         defaults_hours = defaults.get("business_hours", _default_business_hours())
         for day in WEEKDAY_LABELS:
@@ -5836,6 +5843,12 @@ class MainWindow(QMainWindow):
         change_password_button = QPushButton("Change password")
         change_password_button.clicked.connect(self.open_change_password)
         footer_row.addWidget(change_password_button)
+        
+        if self.user["role"] in {"IT", "GM"}:
+            backup_button = QPushButton("Backup/Restore")
+            backup_button.clicked.connect(self.open_backup_manager)
+            footer_row.addWidget(backup_button)
+        
         footer_row.addStretch()
         layout.addLayout(footer_row)
 
@@ -5861,8 +5874,8 @@ class MainWindow(QMainWindow):
             on_status_updated=self._handle_validation_status_updated,
         )
         self.tabs.addTab(prep_tab, "Week Preparation")
-        self.tabs.addTab(self.week_schedule_page, "Week Schedule")
-        self.tabs.addTab(self.validation_page, "Validate / Import / Export")
+        self.tabs.addTab(self._wrap_tab(self.week_schedule_page), "Week Schedule")
+        self.tabs.addTab(self._wrap_tab(self.validation_page), "Validate / Import / Export")
         enabled = self.week_schedule_page.week_start is not None
         self.tabs.setTabEnabled(1, enabled)
         self.tabs.setTabEnabled(2, enabled)
@@ -5906,6 +5919,13 @@ class MainWindow(QMainWindow):
             details={"iso_year": iso_year, "iso_week": iso_week, "label": label},
         )
         self.reset_session_timers()
+
+    def _wrap_tab(self, widget: QWidget) -> QScrollArea:
+        """Wrap heavyweight tab content in a scroll area so everything stays reachable."""
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setWidget(widget)
+        return scroll_area
 
     def _handle_schedule_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
         computed_label = week_label(iso_year, iso_week)
@@ -6063,6 +6083,11 @@ class MainWindow(QMainWindow):
         dialog = PolicyDialog(self.session_factory, self.user, read_only=not can_edit)
         dialog.setStyleSheet(THEME_STYLESHEET)
         dialog.exec()
+    
+    def open_backup_manager(self) -> None:
+        dialog = BackupManagerDialog(self)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        dialog.exec()
 
     def handle_logout(self) -> None:
         confirm = QMessageBox.question(self, "Sign out", "Return to sign-in screen?")
@@ -6083,6 +6108,13 @@ def launch_app() -> int:
     store = AccountStore(ACCOUNTS_FILE)
     init_database()
     ensure_default_policy(SessionLocal)
+    
+    # Perform automatic backup on startup
+    try:
+        auto_backup_on_startup()
+        cleanup_old_auto_backups(keep_count=5)
+    except Exception:
+        pass  # Silently ignore backup errors to not block app startup
 
     while True:
         login = LoginDialog(store)
@@ -6116,6 +6148,3 @@ def launch_app() -> int:
 
 if __name__ == "__main__":
     sys.exit(launch_app())
-
-
-

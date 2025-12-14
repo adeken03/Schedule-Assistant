@@ -7,6 +7,7 @@ the assignment’s intent without refactoring the DB.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import datetime
 import sys
 from pathlib import Path
@@ -29,6 +30,7 @@ from database import (  # noqa: E402
     WeekContext,
     WeekDailyProjection,
     apply_saved_modifier_to_week,
+    init_database,
     get_active_policy,
     get_or_create_week,
     get_or_create_week_context,
@@ -40,13 +42,21 @@ from database import (  # noqa: E402
     set_week_status,
 )
 from generator.api import generate_schedule_for_week  # noqa: E402
+from policy import ensure_default_policy  # noqa: E402
 from database import Policy, upsert_policy, Employee  # noqa: E402
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 from validation import validate_week_schedule  # noqa: E402
 
 
-app = FastAPI(title="Schedule Assistant API", version="0.1")
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    init_database()
+    ensure_default_policy(SessionLocal)
+    yield
+
+
+app = FastAPI(title="Schedule Assistant API", version="0.1", lifespan=lifespan)
 
 
 def get_db():

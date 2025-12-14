@@ -35,11 +35,14 @@ from policy import (
     resolve_policy_block,
     role_definition,
     parse_time_label,
+    mid_minutes,
     shift_length_limits,
     shift_length_rule,
     pre_engine_settings,
     required_roles,
     ROLE_GROUP_ALLOCATIONS,
+    resolve_section_weights,
+    resolve_hoh_thresholds,
 )
 from roles import is_manager_role, normalize_role, role_matches, role_group
 
@@ -48,7 +51,33 @@ WEEKDAY_TOKENS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
 HALF_HOUR = datetime.timedelta(minutes=30)
 LABOR_PER_100_SALES = {"Servers": 0.18, "Bartenders": 0.05, "Kitchen": 0.2, "Cashier": 0.06}
 MIN_STAFF_DEFAULTS = {"Servers": 1, "Server": 1, "Bartenders": 1, "Bartender": 1, "Kitchen": 2, "Cashier": 0}
+GLOBAL_CUT_RANKS = {
+    "patio": 0,
+    "cocktail": 1,
+    "dining": 2,
+    "cashier": 3,
+    "hoh_chip_shake": 4,
+    "hoh_grill": 5,
+    "hoh_sw": 6,
+    "preclose": 7,
+    "closer": 99,
+    "expo": 100,
+}
 SHIFT_TEMPLATE_CONFIG = {
+    "BWW_AM": [
+        {"start": "11:15", "end": "16:15"},
+        {"start": "11:30", "end": "16:30"},
+        {"start": "11:45", "end": "16:45"},
+        {"start": "12:00", "end": "17:00"},
+        {"start": "12:30", "end": "17:30"},
+    ],
+    "BWW_PM": [
+        {"start": "15:30", "end": "21:30"},
+        {"start": "16:00", "end": "22:30"},
+        {"start": "16:15", "end": "22:45"},
+        {"start": "16:30", "end": "23:00"},
+        {"start": "17:00", "end": "23:30"},
+    ],
     "Servers": [
         {"style": "Open", "time": "open-00:45", "hours": 7.5},
         {"style": "Lunch", "time": "11:00", "hours": 5.5},
@@ -115,7 +144,7 @@ class ScheduleGenerator:
         *,
         cut_relax_level: int = 0,
         employee_session=None,
-    ) -> None:
+) -> None:
         self.session = session
         self.employee_session = employee_session
         self.policy = policy or {}
@@ -144,6 +173,7 @@ class ScheduleGenerator:
         # Open buffer is fixed at 30 minutes (10:30-11:00 window).
         self.open_buffer_minutes: int = 30
         self.close_buffer_minutes: int = int(global_cfg.get("close_buffer_minutes", 35) or 0)
+        self.max_hours_per_day: float = float(global_cfg.get("max_hours_day", 8.0) or 8.0)
         labor_pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
         if labor_pct > 1.0:
             labor_pct /= 100.0
@@ -155,19 +185,39 @@ class ScheduleGenerator:
         self.budget_target_ratio = max(0.75, 1.0 - (self.labor_budget_tolerance / 2.0))
         self.pre_engine = pre_engine_settings(self.policy)
         self.pre_engine_staffing = self.pre_engine.get("staffing", {})
-        self.required_role_labels: Set[str] = set(required_roles(self.policy))
+        # Final BWW-required roles always enforced, even if policy omitted them.
+        bww_required = {
+            "Bartender - Opener",
+            "Bartender - Closer",
+            "Server - Opener",
+            "Server - Dining Preclose",
+            "Server - Dining Closer",
+            "Server - Cocktail Preclose",
+            "Server - Cocktail Closer",
+            "HOH - Opener",
+            "HOH - Expo",
+            "HOH - Southwest",
+            "HOH - Chip",
+            "HOH - Shake",
+            "HOH - Grill",
+        }
+        self.required_role_labels: Set[str] = {
+            role for role in set(required_roles(self.policy)).union(bww_required) if normalize_role(role) != "hoh - closer"
+        }
         fallback_cfg = self.pre_engine.get("fallback", {})
         self.manager_fallback_allowed = bool(fallback_cfg.get("allow_mgr_fallback", False))
         self.manager_fallback_limits = {
             "am": int(fallback_cfg.get("am_limit", 1) or 0),
             "pm": int(fallback_cfg.get("pm_limit", 1) or 0),
         }
-        self.manager_fallback_tag = fallback_cfg.get("tag", "MANAGER COVERING — REVIEW REQUIRED")
+        self.manager_fallback_tag = fallback_cfg.get("tag", "MGR-FOH covering for budget/coverage")
         self.manager_fallback_disallow = [str(entry).lower() for entry in fallback_cfg.get("disallow_roles", [])]
         self.manager_fallback_counts: Dict[int, Dict[str, int]] = {idx: {"am": 0, "pm": 0} for idx in range(7)}
         hoh_cfg = self.pre_engine_staffing.get("hoh", {})
         self.non_combinable_roles: Set[str] = {normalize_role(role) for role in hoh_cfg.get("non_combinable", [])}
         self.volume_thresholds = self.pre_engine_staffing.get("volume_thresholds", {})
+        self.section_weights = resolve_section_weights(self.policy)
+        self.hoh_thresholds = resolve_hoh_thresholds(self.policy)
         self.errors: List[str] = []
 
         self.employees: List[Dict[str, Any]] = []
@@ -178,6 +228,7 @@ class ScheduleGenerator:
         self.warnings: List[str] = []
         self.cut_insights: List[Dict[str, Any]] = []
         self.unfilled_slots: List[Dict[str, Any]] = []
+        self.section_coverage: List[Dict[str, Any]] = []
         self.interchangeable_groups: Set[str] = {"Cashier"}
         self.random = random.Random()
         self.group_pressure: Dict[int, Dict[str, float]] = {}
@@ -250,19 +301,43 @@ class ScheduleGenerator:
 
         self._reset_week(week)
         self.employees = self._load_employee_profiles()
-        self.random.shuffle(self.employees)
         self.modifiers_by_day = self._load_modifiers(week.week_start_date)
         self.day_contexts = self._build_day_contexts(context, week.week_start_date)
         self.group_budget_by_day = self._build_group_budgets()
-        self.cut_insights.clear()
-        demands = self._compute_block_demands(week.week_start_date)
-        assignments = self._assign(demands)
-        self._apply_budget_cuts(assignments, demands)
-        self._retry_unfilled_assignments(assignments)
-        self._enforce_shift_continuity(assignments, week.week_start_date)
-        self._warn_unpaired_openers()
-        self._check_section_thresholds(assignments)
-        self._record_required_role_gaps(assignments)
+        self._base_employees = copy.deepcopy(self.employees)
+        max_attempts = max(1, int(self.pre_engine.get("generation_attempts", 3) or 3))
+        best_payload = None
+        best_score = float("inf")
+        for attempt in range(max_attempts):
+            self._reset_attempt_state()
+            self.random.shuffle(self.employees)
+            assignments = self._build_assignments_once(week.week_start_date)
+            missing_required = self._missing_required_roles(assignments)
+            score = missing_required * 1000 + len(self.unfilled_slots) * 100 + len(self.errors) * 10 + len(self.warnings)
+            if score < best_score:
+                best_score = score
+                best_payload = {
+                    "assignments": assignments,
+                    "warnings": list(self.warnings),
+                    "errors": list(self.errors),
+                    "cut_insights": list(self.cut_insights),
+                    "section_coverage": list(self.section_coverage),
+                }
+            if best_score == 0:
+                break
+        if best_payload is None:
+            return {
+                "week_id": week.id,
+                "days": [],
+                "total_cost": 0.0,
+                "warnings": ["Failed to generate any schedule."],
+                "cut_insights": [],
+            }
+        assignments = best_payload["assignments"]
+        self.warnings = best_payload["warnings"]
+        self.errors = best_payload["errors"]
+        self.cut_insights = best_payload["cut_insights"]
+        self.section_coverage = best_payload["section_coverage"]
 
         created_ids: List[int] = []
         for payload in assignments:
@@ -290,6 +365,75 @@ class ScheduleGenerator:
         self.unfilled_slots = []
         self.errors = []
         self.manager_fallback_counts = {idx: {"am": 0, "pm": 0} for idx in range(7)}
+
+    def _reset_attempt_state(self) -> None:
+        """Clear per-attempt state so retries do not leak assignments or warnings."""
+        self.warnings = []
+        self.errors = []
+        self.cut_insights = []
+        self.section_coverage = []
+        self.unfilled_slots = []
+        self.current_slot_matrix = {}
+        self.manager_fallback_counts = {idx: {"am": 0, "pm": 0} for idx in range(7)}
+        if getattr(self, "_base_employees", None):
+            self.employees = copy.deepcopy(self._base_employees)
+        if getattr(self, "employees", None):
+            self.employee_lookup = {emp["id"]: emp for emp in self.employees if emp.get("id") is not None}
+            for emp in self.employees:
+                emp["total_hours"] = 0.0
+                emp["assignments"] = {idx: [] for idx in range(7)}
+                emp["day_last_block_end"] = {idx: None for idx in range(7)}
+                emp["last_assignment_end"] = None
+                emp["days_with_assignments"] = set()
+                emp["last_day_index"] = None
+                emp["consecutive_days"] = 0
+                emp["pending_open_links"] = {idx: [] for idx in range(7)}
+                emp["day_meta"] = {idx: [] for idx in range(7)}
+
+    def _build_assignments_once(self, week_start: datetime.date) -> List[Dict[str, Any]]:
+        """Single-pass generation used by the attempt loop to pick the best schedule."""
+        plans = self._build_bww_week_plan(week_start)
+        self._apply_bww_budget(plans)
+        assignments = self._assign_from_plans(plans)
+        self._retry_unfilled_assignments(assignments)
+
+        def _day_map(shifts: List[Dict[str, Any]]) -> Dict[int, List[Dict[str, Any]]]:
+            mapping: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+            for shift in shifts:
+                start = shift.get("start")
+                if not isinstance(start, datetime.datetime):
+                    continue
+                mapping[self._day_index_from_datetime(week_start, start)].append(shift)
+            return mapping
+
+        day_map = _day_map(assignments)
+        self._apply_budget_cuts(assignments, getattr(self, "current_slot_matrix", {}))
+        self._refine_assignments(assignments)
+        self._enforce_shift_continuity(assignments, week_start)
+        day_map = _day_map(assignments)
+        self._normalize_bartender_openers(assignments)
+        self._ensure_opener_followups(day_map, assignments, week_start)
+        self._force_bartender_opener_pair(assignments)
+        self._ensure_closer_continuity(day_map, assignments, week_start)
+        self._warn_unpaired_openers()
+        self._check_section_thresholds(assignments)
+        self._record_required_role_gaps(assignments)
+        return assignments
+
+    def _missing_required_roles(self, assignments: List[Dict[str, Any]]) -> int:
+        """Count missing required roles without mutating error state (used for scoring attempts)."""
+        if not self.required_role_labels:
+            return 0
+        missing = 0
+        for day_index in range(7):
+            for role_label in self.required_role_labels:
+                has_role = any(
+                    role_matches(shift.get("role", ""), role_label) and self._day_index_for_shift(shift) == day_index
+                    for shift in assignments
+                )
+                if not has_role:
+                    missing += 1
+        return missing
 
     def _load_employee_profiles(self) -> List[Dict[str, Any]]:
         stmt = (
@@ -493,6 +637,7 @@ class ScheduleGenerator:
                     "weekday_token": WEEKDAY_TOKENS[day_index],
                     "date": week_start + datetime.timedelta(days=day_index),
                     "sales": sales,
+                    "adjusted_sales": adjusted_sales,
                     "notes": notes_payload,
                     "modifier_multiplier": modifier_multiplier,
                     "indices": {},
@@ -630,6 +775,1308 @@ class ScheduleGenerator:
                 matrix[(day_index, group_name)] = {"slots": slot_records, "open": open_dt, "close": close_dt}
         self.current_slot_matrix = matrix
         return matrix
+
+    def _bww_day_frame(self, day_ctx: Dict[str, Any]) -> Dict[str, Any]:
+        """Build the fixed BWW day frame (open buffer, AM/PM, close buffer)."""
+        date_value = day_ctx.get("date")
+        if not isinstance(date_value, datetime.date):
+            return {}
+        day_index = int(day_ctx.get("day_index", date_value.weekday()))
+        day_start = datetime.datetime.combine(date_value, datetime.time.min, tzinfo=UTC)
+        # Enforce 11:00 open with a 10:30 opener buffer.
+        open_dt = day_start + datetime.timedelta(hours=11)
+        opener_start = open_dt - datetime.timedelta(minutes=max(1, self.open_buffer_minutes))
+        # AM/PM split follows the policy mid-time.
+        mid_min = mid_minutes(self.policy, date_value)
+        am_end = day_start + datetime.timedelta(minutes=mid_min)
+        if am_end <= open_dt:
+            am_end = open_dt + datetime.timedelta(hours=5)
+        pm_start = am_end
+        close_dt = day_start + datetime.timedelta(minutes=close_minutes(self.policy, date_value))
+        if close_dt <= open_dt:
+            close_dt += datetime.timedelta(days=1)
+        buffer_minutes = max(0, self.close_buffer_minutes or 35)
+        close_end = close_dt + datetime.timedelta(minutes=buffer_minutes)
+        demand_index = day_ctx.get("indices", {}).get("demand_index", 1.0)
+        adjusted_sales = float(day_ctx.get("adjusted_sales", 0.0) or 0.0)
+        sales = float(day_ctx.get("sales", 0.0) or 0.0)
+        modifier_multiplier = float(day_ctx.get("modifier_multiplier", 1.0) or 1.0)
+        return {
+            "date": date_value,
+            "day_index": day_index,
+            "weekday_token": WEEKDAY_TOKENS[day_index],
+            "open_dt": open_dt,
+            "opener_start": opener_start,
+            "am_end": am_end,
+            "pm_start": pm_start,
+            "close_dt": close_dt,
+            "close_end": close_end,
+            "demand_index": demand_index,
+            "adjusted_sales": adjusted_sales,
+            "sales": sales,
+            "modifier_multiplier": modifier_multiplier,
+        }
+
+    def _dt_from_label(self, date_value: datetime.date, label: Optional[str]) -> Optional[datetime.datetime]:
+        minutes = parse_time_label(label) if label else None
+        if minutes is None:
+            return None
+        day_offset = minutes // (24 * 60)
+        minute_of_day = minutes % (24 * 60)
+        base = datetime.datetime.combine(date_value, datetime.time.min, tzinfo=UTC)
+        return base + datetime.timedelta(days=day_offset, minutes=minute_of_day)
+
+    def _policy_preset_window(
+        self, role_name: str, group_label: str, period: str, frame: Dict[str, Any]
+    ) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
+        presets = {}
+        if isinstance(self.shift_presets, dict):
+            presets = self.shift_presets.get(role_name) or self.shift_presets.get(group_label) or {}
+        if not isinstance(presets, dict):
+            return None
+        windows = presets.get(period) or []
+        if not isinstance(windows, list):
+            return None
+        for entry in windows:
+            if not isinstance(entry, dict):
+                continue
+            start = self._dt_from_label(frame["date"], entry.get("start"))
+            end = self._dt_from_label(frame["date"], entry.get("end"))
+            if not start or not end:
+                continue
+            if end <= start:
+                continue
+            return self._snap_datetime(start), self._snap_datetime(end)
+        return None
+
+    def _resolve_pattern_window(
+        self, group_label: str, day_token: str, period: str, frame: Dict[str, Any]
+    ) -> Optional[Tuple[datetime.datetime, datetime.datetime]]:
+        templates = self.pattern_templates.get(group_label, {})
+        day_template = templates.get(day_token) or templates.get(day_token.capitalize()) or templates.get("default", {})
+        windows = day_template.get(period) if isinstance(day_template, dict) else None
+        if not windows and isinstance(templates.get("default"), dict):
+            windows = templates["default"].get(period)
+        if not windows or not isinstance(windows, list):
+            return None
+        entry = windows[0] if windows else {}
+        start = self._dt_from_label(frame["date"], entry.get("start"))
+        end = self._dt_from_label(frame["date"], entry.get("end"))
+        if not start or not end:
+            return None
+        if end <= start:
+            end = end + datetime.timedelta(days=1)
+        return start, end
+
+    def _build_bww_week_plan(self, week_start: datetime.date) -> List[Dict[str, Any]]:
+        plans: List[Dict[str, Any]] = []
+        if not self.day_contexts:
+            return plans
+        for ctx in self.day_contexts:
+            frame = self._bww_day_frame(ctx)
+            if not frame:
+                continue
+            day_plans, coverage = self._build_bww_day_plan(ctx, frame)
+            plans.extend(day_plans)
+            if coverage:
+                self.section_coverage.append({"date": frame["date"], **coverage})
+        return sorted(plans, key=lambda p: (p["day_index"], p["start"]))
+
+    def _resolve_server_targets(self, tier: str, section: str) -> Tuple[int, int]:
+        server_cfg = self.pre_engine_staffing.get("servers", {})
+        cfg = server_cfg.get(section, {}) if isinstance(server_cfg, dict) else {}
+        if section == "dining":
+            slow_min = int(cfg.get("slow_min", 1))
+            slow_max = int(cfg.get("slow_max", 4))
+            moderate = int(cfg.get("moderate", 5))
+            peak_val = int(cfg.get("peak", 6))
+            manual_max = int(cfg.get("manual_max", peak_val))
+            if tier in {"low", "slow"}:
+                am_val = max(1, slow_min)
+                pm_val = max(1, slow_max)
+            elif tier == "moderate":
+                am_val = max(1, moderate)
+                pm_val = max(1, moderate)
+            elif tier == "high":
+                am_val = max(1, peak_val)
+                pm_val = max(1, peak_val)
+            else:  # peak
+                am_val = max(1, manual_max)
+                pm_val = max(1, manual_max)
+            am_val = min(am_val, slow_max if tier == "slow" else manual_max)
+            pm_val = min(pm_val, manual_max)
+            return am_val, pm_val
+        if section == "cocktail":
+            normal = int(cfg.get("normal", 2))
+            busy = int(cfg.get("busy", 3))
+            peak_val = int(cfg.get("peak", 4))
+            manual_max = int(cfg.get("manual_max", peak_val))
+            if tier in {"low", "slow"}:
+                base = min(normal, busy)
+            elif tier == "moderate":
+                base = max(normal, busy)
+            elif tier == "high":
+                base = peak_val
+            else:  # peak
+                base = manual_max
+            base = min(base, manual_max)
+            base = max(1, base)
+            return base, base
+        return 0, 0
+
+    def _resolve_bartender_targets(self, tier: str) -> Tuple[int, int]:
+        """Return (AM_count, PM_count) bartenders; PM includes the closer. Always at least one."""
+        cfg = self.pre_engine_staffing.get("bartenders", {}) if isinstance(self.pre_engine_staffing, dict) else {}
+        am_cfg = cfg.get("am", {}) if isinstance(cfg, dict) else {}
+        pm_cfg = cfg.get("pm", {}) if isinstance(cfg, dict) else {}
+
+        def _target(source: Dict[str, Any]) -> int:
+            value = source.get(tier) if isinstance(source, dict) else None
+            try:
+                return max(1, int(value)) if value is not None else 1
+            except (TypeError, ValueError):
+                return 1
+
+        return _target(am_cfg), _target(pm_cfg)
+
+    def _hoh_stage(self, demand_index: float, tier: Optional[str] = None) -> str:
+        # Tier-driven override: map low/moderate -> combo, high -> split, peak -> peak.
+        tier_norm = (tier or "").lower()
+        if tier_norm in {"low", "slow"}:
+            return "combo"
+        if tier_norm == "moderate":
+            return "combo"
+        if tier_norm == "high":
+            return "split"
+        if tier_norm == "peak":
+            return "peak"
+        mode = (self.policy.get("hoh_mode") or "auto").lower()
+        combo_enabled = float(self.hoh_thresholds.get("combo_enabled_max", 0.55))
+        split_threshold = float(self.hoh_thresholds.get("split_threshold", 0.75))
+        peak_threshold = float(self.hoh_thresholds.get("peak_threshold", 1.0))
+        if mode == "peak" or demand_index >= peak_threshold:
+            return "peak"
+        if mode == "split" or demand_index >= split_threshold:
+            return "split"
+        if mode == "combo" or demand_index <= combo_enabled:
+            return "combo"
+        return "balanced"
+
+    def _hoh_sequence(self, frame: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Return HOH sequencing with AM and PM waves (no single 11+ hour blocks)."""
+        open_dt = frame["open_dt"]
+        am_end = frame["am_end"]
+        pm_start = frame["pm_start"]
+        close_dt = frame["close_dt"]
+        demand_index = frame.get("demand_index", 1.0)
+        combo_enabled = float(self.hoh_thresholds.get("combo_enabled_max", 0.55))
+        split_threshold = float(self.hoh_thresholds.get("split_threshold", 0.75))
+        stage = self._hoh_stage(demand_index, frame.get("tier"))
+        am_combo = stage in {"combo", "balanced"}
+        pm_combo = stage in {"combo"} and demand_index <= split_threshold
+        combo_roles = self.pre_engine_staffing.get("hoh", {}).get("combo_roles", {})
+        max_hours_default = 8.0
+        plans: List[Dict[str, Any]] = []
+
+        def _cap_end(start_dt: datetime.datetime, desired_end: datetime.datetime) -> datetime.datetime:
+            if desired_end <= start_dt:
+                return start_dt
+            max_hours = max_hours_default
+            try:
+                max_hours = min(max_hours_default, shift_length_limits(self.policy, "HOH - Southwest", "Kitchen")[1])
+            except Exception:
+                max_hours = max_hours_default
+            return min(desired_end, start_dt + datetime.timedelta(hours=max_hours))
+
+        def _append(role_name: str, start_dt: datetime.datetime, desired_end: datetime.datetime, block: str, *, cut_rank: int) -> None:
+            end_dt = _cap_end(start_dt, desired_end)
+            if end_dt <= start_dt:
+                return
+            plans.append(
+                {
+                    "role": role_name,
+                    "start": start_dt,
+                    "end": end_dt,
+                    "block": block,
+                    "section": "hoh",
+                    "essential": True,
+                    "allow_cut": True,
+                    "cut_rank": cut_rank,
+                }
+            )
+
+        # --- AM wave ---
+        am_cap = min(am_end, pm_start, open_dt + datetime.timedelta(hours=6))
+        sw_start = open_dt
+        chip_start = open_dt + datetime.timedelta(minutes=15)
+        shake_start = open_dt + datetime.timedelta(minutes=75)
+        grill_start = open_dt + datetime.timedelta(minutes=180)
+
+        if am_combo:
+            _append(
+                combo_roles.get("sw_grill", "HOH - Southwest & Grill"),
+                sw_start,
+                am_cap,
+                "AM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_grill"],
+            )
+            _append(
+                combo_roles.get("chip_shake", "HOH - Chip & Shake"),
+                chip_start,
+                am_cap,
+                "AM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"],
+            )
+        else:
+            _append("HOH - Southwest", sw_start, min(am_cap, sw_start + datetime.timedelta(hours=4)), "AM", cut_rank=GLOBAL_CUT_RANKS["hoh_sw"])
+            _append("HOH - Chip", chip_start, min(am_cap, chip_start + datetime.timedelta(hours=3.5)), "AM", cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"])
+            _append("HOH - Shake", shake_start, am_cap, "AM", cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"])
+            _append("HOH - Grill", grill_start, am_cap, "AM", cut_rank=GLOBAL_CUT_RANKS["hoh_grill"])
+
+        # --- PM wave ---
+        buffer_window = datetime.timedelta(minutes=max(30, self.close_buffer_minutes or 30))
+        pm_cap = close_dt - buffer_window
+        if pm_cap <= pm_start:
+            pm_cap = close_dt - datetime.timedelta(minutes=30)
+        sw_pm_start = pm_start
+        chip_pm_start = sw_pm_start + datetime.timedelta(minutes=15)
+        shake_pm_start = sw_pm_start + datetime.timedelta(minutes=75)
+        grill_pm_start = sw_pm_start + datetime.timedelta(minutes=180)
+
+        if pm_combo:
+            _append(
+                combo_roles.get("sw_grill", "HOH - Southwest & Grill"),
+                sw_pm_start,
+                min(pm_cap, sw_pm_start + datetime.timedelta(hours=6)),
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_grill"],
+            )
+            _append(
+                combo_roles.get("chip_shake", "HOH - Chip & Shake"),
+                chip_pm_start,
+                min(pm_cap, chip_pm_start + datetime.timedelta(hours=5.5)),
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"],
+            )
+        else:
+            _append(
+                "HOH - Southwest",
+                sw_pm_start,
+                min(pm_cap - datetime.timedelta(hours=3), sw_pm_start + datetime.timedelta(hours=5)),
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_sw"],
+            )
+            _append(
+                "HOH - Chip",
+                chip_pm_start,
+                min(pm_cap - datetime.timedelta(hours=2), chip_pm_start + datetime.timedelta(hours=4)),
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"],
+            )
+            _append(
+                "HOH - Shake",
+                shake_pm_start,
+                min(pm_cap - datetime.timedelta(hours=1), shake_pm_start + datetime.timedelta(hours=5.5)),
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_chip_shake"],
+            )
+            _append(
+                "HOH - Grill",
+                grill_pm_start,
+                pm_cap,
+                "PM",
+                cut_rank=GLOBAL_CUT_RANKS["hoh_grill"],
+            )
+
+        return plans
+
+    def _add_plan_entry(
+        self,
+        plans: List[Dict[str, Any]],
+        *,
+        role: str,
+        start: datetime.datetime,
+        end: datetime.datetime,
+        block: str,
+        day_index: int,
+        date_value: datetime.date,
+        section: Optional[str],
+        allow_cut: bool,
+        essential: bool,
+        cut_rank: int = 0,
+        note: Optional[str] = None,
+        pair_key: Optional[str] = None,
+    ) -> None:
+        if end <= start:
+            return
+        # Normalize non-closer shift duration to <= 8h to avoid unrealistic all-day blocks.
+        if (block or "").lower() != "close" and not self._is_closer_block(role, block):
+            max_span = datetime.timedelta(hours=8)
+            if end - start > max_span:
+                end = start + max_span
+        plans.append(
+            {
+                "role": role,
+                "start": self._snap_datetime(start),
+                "end": self._snap_datetime(end),
+                "block": block,
+                "day_index": day_index,
+                "date": date_value,
+                "section": section,
+                "allow_cut": allow_cut,
+                "essential": essential,
+                "cut_rank": cut_rank,
+                "note": note or "",
+                "role_group": self._canonical_group(role_group(role)),
+                "_pair_key": pair_key,
+            }
+        )
+
+    def _build_bww_day_plan(self, ctx: Dict[str, Any], frame: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        plans: List[Dict[str, Any]] = []
+        coverage: Dict[str, Any] = {}
+        day_index = frame["day_index"]
+        date_value = frame["date"]
+        tier = self._volume_tier(frame.get("demand_index", 1.0), frame.get("adjusted_sales", 0.0))
+        ctx["tier"] = tier
+        frame["tier"] = tier
+        # Align demand_index with absolute tier to keep validators/HOH logic consistent.
+        demand_idx_override = {"low": 0.3, "slow": 0.3, "moderate": 0.6, "high": 0.9, "peak": 1.1}.get(tier, 0.6)
+        frame["demand_index"] = demand_idx_override
+        templates_am = SHIFT_TEMPLATE_CONFIG.get("BWW_AM", [])
+        templates_pm = SHIFT_TEMPLATE_CONFIG.get("BWW_PM", [])
+
+        def _preferred_window(role_name: str, group_label: str, period: str, *, min_start, max_end, fallback):
+            window = self._policy_preset_window(role_name, group_label, period, frame)
+            if not window:
+                # Use BWW templates as fallback inspiration.
+                template_list = templates_am if period == "am" else templates_pm
+                window = None
+                for spec in template_list:
+                    start_dt = self._dt_from_label(date_value, spec.get("start"))
+                    end_dt = self._dt_from_label(date_value, spec.get("end"))
+                    if not start_dt or not end_dt:
+                        continue
+                    window = (start_dt, end_dt)
+                    break
+            if not window:
+                window = fallback
+            start_dt, end_dt = window
+            if start_dt < min_start:
+                start_dt = min_start
+            if end_dt > max_end:
+                end_dt = max_end
+            if end_dt <= start_dt:
+                return fallback
+            return self._snap_datetime(start_dt), self._snap_datetime(end_dt)
+
+        def _staggered_starts(
+            base_start: datetime.datetime, count: int, *, interval_minutes: int = 15, max_spread_minutes: int = 30
+        ) -> List[datetime.datetime]:
+            """Return start times staggered in 15-minute increments up to a short spread."""
+            starts: List[datetime.datetime] = []
+            for idx in range(max(0, count)):
+                offset = min(idx * interval_minutes, max_spread_minutes)
+                starts.append(self._snap_datetime(base_start + datetime.timedelta(minutes=offset)))
+            return starts
+
+        def _cashier_window(period: str, *, min_start, max_end) -> Tuple[datetime.datetime, datetime.datetime]:
+            """
+            Pick a cashier window that honors policy presets but delays starts when demand is low/slow.
+            Earlier starts are only used when tier is high/peak.
+            """
+            def _pattern_windows() -> List[Tuple[datetime.datetime, datetime.datetime]]:
+                templates = self.pattern_templates.get("Cashier", {})
+                day_template = templates.get(frame["weekday_token"]) or templates.get(
+                    frame["weekday_token"].capitalize()
+                ) or templates.get("default", {})
+                windows = day_template.get(period) if isinstance(day_template, dict) else None
+                if not windows and isinstance(templates.get("default"), dict):
+                    windows = templates["default"].get(period)
+                parsed: List[Tuple[datetime.datetime, datetime.datetime]] = []
+                if not windows or not isinstance(windows, list):
+                    return parsed
+                for entry in windows:
+                    if not isinstance(entry, dict):
+                        continue
+                    start = self._dt_from_label(frame["date"], entry.get("start"))
+                    end = self._dt_from_label(frame["date"], entry.get("end"))
+                    if not start or not end:
+                        continue
+                    if end <= start:
+                        end = end + datetime.timedelta(days=1)
+                    parsed.append((start, end))
+                return parsed
+
+            pattern_list = _pattern_windows()
+            preset_window = self._policy_preset_window("Cashier", "Cashier", period, frame)
+            # Choose a window: prefer pattern list (earliest for high/peak, latest for low/slow, middle for moderate).
+            window_choice: Optional[Tuple[datetime.datetime, datetime.datetime]] = None
+            if pattern_list:
+                if tier in {"low", "slow"}:
+                    window_choice = pattern_list[-1]
+                elif tier in {"high", "peak"}:
+                    window_choice = pattern_list[0]
+                else:
+                    mid_idx = min(len(pattern_list) - 1, len(pattern_list) // 2)
+                    window_choice = pattern_list[mid_idx]
+            elif preset_window:
+                window_choice = preset_window
+            else:
+                window_choice = (min_start, max_end)
+
+            start_dt, end_dt = window_choice
+            start_dt = max(start_dt, min_start)
+            end_dt = min(end_dt, max_end)
+            offset_map = {"low": 45, "slow": 30, "moderate": 15, "high": 0, "peak": 0}
+            offset = datetime.timedelta(minutes=offset_map.get(tier, 15 if period == "am" else 0))
+            min_hours, _ = shift_length_limits(self.policy, "Cashier", "Cashier")
+            duration = datetime.timedelta(hours=max(min_hours, 2.5))
+            latest_start = max_end - duration
+            adjusted_start = start_dt + offset
+            adjusted_start = min(
+                max(adjusted_start, min_start),
+                latest_start if latest_start > min_start else min_start,
+            )
+            if adjusted_start >= end_dt:
+                adjusted_start = max(start_dt, min_start)
+            return self._snap_datetime(adjusted_start), self._snap_datetime(end_dt)
+
+        # Bartenders
+        bt_am_target, bt_pm_target = self._resolve_bartender_targets(tier)
+        # Opener is always a fixed 10:30-11:00 job code; do not let presets extend it.
+        bt_am_window = (frame["opener_start"], frame["open_dt"])
+        bt_pm_window = self._policy_preset_window("Bartenders", "Bartenders", "pm", frame) or self._resolve_pattern_window("Bartenders", frame["weekday_token"], "pm", frame) or (
+            max(frame["pm_start"], frame["close_dt"] - datetime.timedelta(hours=5)),
+            frame["close_dt"],
+        )
+        # Closer must work a real PM block into close (avoid 30-min-only closers).
+        pm_end_capped = frame["close_dt"]
+        closer_min_start = frame["close_dt"] - datetime.timedelta(hours=5)
+        pm_start_capped = max(frame["pm_start"], min(bt_pm_window[0], closer_min_start))
+        bar_pair = f"bar_closer:{day_index}"
+        bar_open_pair = f"bar_opener:{day_index}"
+        # 10:30-11:00 opener job code (always first cut).
+        self._add_plan_entry(
+            plans,
+            role="Bartender - Opener",
+            start=bt_am_window[0],
+            end=bt_am_window[1],
+            block="Open",
+            day_index=day_index,
+            date_value=date_value,
+            section="bar",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+            note="Opener (fixed 10:30 buffer)",
+            pair_key=bar_open_pair,
+        )
+        # Follow-on AM shift for the opener (first cut).
+        bt_am_cover = _preferred_window(
+            "Bartender",
+            "Bartenders",
+            "am",
+            min_start=frame["open_dt"],
+            max_end=frame["am_end"],
+            fallback=(frame["open_dt"], frame["am_end"]),
+        )
+        # Force AM follow shift to start at open for continuity.
+        bt_am_cover = (frame["open_dt"], bt_am_cover[1])
+        self._add_plan_entry(
+            plans,
+            role="Bartender",
+            start=bt_am_cover[0],
+            end=bt_am_cover[1],
+            block="AM",
+            day_index=day_index,
+            date_value=date_value,
+            section="bar",
+            allow_cut=True,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+            note="Opener follow (first cut)",
+            pair_key=bar_open_pair,
+        )
+        am_extra = max(0, bt_am_target - 1)
+        for _idx in range(am_extra):
+            self._add_plan_entry(
+                plans,
+                role="Bartender",
+                start=bt_am_cover[0],
+                end=bt_am_cover[1],
+                block="AM",
+                day_index=day_index,
+                date_value=date_value,
+                section="bar",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+                note="Bartender AM",
+            )
+        # PM support bartenders (excluding the closer).
+        pm_support_window = _preferred_window(
+            "Bartender",
+            "Bartenders",
+            "pm",
+            min_start=frame["pm_start"],
+            max_end=frame["close_dt"],
+            fallback=(frame["pm_start"], min(frame["close_dt"], frame["pm_start"] + datetime.timedelta(hours=6))),
+        )
+        pm_support_end = min(pm_support_window[1], frame["close_dt"] - datetime.timedelta(minutes=45))
+        pm_support_start = pm_support_window[0]
+        pm_support_count = max(0, bt_pm_target - 1)
+        if pm_support_end > pm_support_start and pm_support_count:
+            for _idx in range(pm_support_count):
+                self._add_plan_entry(
+                    plans,
+                    role="Bartender",
+                    start=pm_support_start,
+                    end=pm_support_end,
+                    block="PM",
+                    day_index=day_index,
+                    date_value=date_value,
+                    section="bar",
+                    allow_cut=True,
+                    essential=False,
+                    cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+                    note="Bartender PM",
+                )
+        self._add_plan_entry(
+            plans,
+            role="Bartender",
+            start=pm_start_capped,
+            end=pm_end_capped,
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="bar",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Closer (last out)",
+            pair_key=bar_pair,
+        )
+        # Close buffer job code.
+        self._add_plan_entry(
+            plans,
+            role="Bartender - Closer",
+            start=frame["close_dt"],
+            end=frame["close_end"],
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="bar",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Close buffer",
+            pair_key=bar_pair,
+        )
+        coverage["bartenders_am"] = bt_am_target
+        coverage["bartenders_pm"] = bt_pm_target
+
+        # Server openers/closers and section staffing.
+        dining_am, dining_pm = self._resolve_server_targets(tier, "dining")
+        cocktail_am, cocktail_pm = self._resolve_server_targets(tier, "cocktail")
+        patio_enabled_cfg = self.policy.get("seasonal_settings", {}) if isinstance(self.policy, dict) else {}
+        patio_enabled = patio_enabled_cfg.get("server_patio_enabled")
+        if patio_enabled is None:
+            patio_role_cfg = self.roles_config.get("Server - Patio", {})
+            patio_enabled = bool(patio_role_cfg.get("enabled", False))
+        else:
+            patio_enabled = bool(patio_enabled)
+        patio_target = 1 if patio_enabled and tier != "slow" else 0
+
+        # Required server opener (open buffer -> AM, first cut).
+        dining_open_pair = f"dining_opener:{day_index}"
+        self._add_plan_entry(
+            plans,
+            role="Server - Opener",
+            start=frame["opener_start"],
+            end=frame["open_dt"],
+            block="Open",
+            day_index=day_index,
+            date_value=date_value,
+            section="dining",
+            allow_cut=True,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["patio"],
+            note="First cut (AM)",
+            pair_key=dining_open_pair,
+        )
+
+        dining_am_required = max(2, dining_am)
+        dining_am_extra = max(0, dining_am_required - 1)
+        am_window = _preferred_window(
+            "Server - Dining",
+            "Servers",
+            "am",
+            min_start=frame["open_dt"],
+            max_end=frame["am_end"],
+            fallback=(frame["open_dt"], frame["am_end"]),
+        )
+        am_end_target = frame["am_end"]
+        am_latest = am_end_target + datetime.timedelta(minutes=15)
+        am_earliest = am_end_target - datetime.timedelta(minutes=15)
+        am_window = (
+            am_window[0],
+            self._snap_datetime(min(max(am_window[1], am_earliest), am_latest)),
+        )
+        dining_am_starts = _staggered_starts(am_window[0], dining_am_required)
+        if not dining_am_starts:
+            dining_am_starts = [am_window[0]]
+        # Force opener follow-up to start immediately at open for continuity.
+        dining_am_starts[0] = frame["open_dt"]
+        # Build AM end times so early arrivals cut earlier while keeping overlap to PM.
+        am_min_dur = datetime.timedelta(hours=4)
+        am_overlap_floor = min(am_end_target, frame["pm_start"] + datetime.timedelta(minutes=30))
+        dining_am_ends: List[datetime.datetime] = []
+        for idx, start_dt in enumerate(dining_am_starts):
+            remaining = len(dining_am_starts) - idx - 1
+            stagger_cut = datetime.timedelta(minutes=30 * remaining)
+            target_end = am_end_target - stagger_cut
+            target_end = max(start_dt + am_min_dur, target_end)
+            if idx >= len(dining_am_starts) - 2:
+                target_end = max(target_end, am_overlap_floor)
+            target_end = min(target_end, am_end_target)
+            dining_am_ends.append(self._snap_datetime(target_end))
+        # Follow-on AM shift for the opener (same section) to ensure continuity.
+        self._add_plan_entry(
+            plans,
+            role="Server - Dining",
+            start=dining_am_starts[0],
+            end=dining_am_ends[0],
+            block="AM",
+            day_index=day_index,
+            date_value=date_value,
+            section="dining",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["dining"],
+            note="Dining opener follow-up",
+            pair_key=dining_open_pair,
+        )
+        for start_dt in dining_am_starts[1:]:
+            idx = dining_am_starts.index(start_dt)
+            self._add_plan_entry(
+                plans,
+                role="Server - Dining",
+                start=start_dt,
+                end=dining_am_ends[idx],
+                block="AM",
+                day_index=day_index,
+                date_value=date_value,
+                section="dining",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["dining"],
+                note="Dining AM",
+            )
+        if cocktail_am:
+            cocktail_am_starts = _staggered_starts(am_window[0], cocktail_am)
+            if not cocktail_am_starts:
+                cocktail_am_starts = [am_window[0]]
+            cocktail_am_ends: List[datetime.datetime] = []
+            for idx, start_dt in enumerate(cocktail_am_starts):
+                remaining = len(cocktail_am_starts) - idx - 1
+                stagger_cut = datetime.timedelta(minutes=30 * remaining)
+                target_end = am_end_target - stagger_cut
+                target_end = max(start_dt + am_min_dur, target_end)
+                if idx >= len(cocktail_am_starts) - 2:
+                    target_end = max(target_end, am_overlap_floor)
+                target_end = min(target_end, am_end_target)
+                cocktail_am_ends.append(self._snap_datetime(target_end))
+            for start_dt in cocktail_am_starts:
+                idx = cocktail_am_starts.index(start_dt)
+                if idx == 0:
+                    start_dt = frame["open_dt"]
+                self._add_plan_entry(
+                    plans,
+                    role="Server - Cocktail",
+                    start=start_dt,
+                    end=cocktail_am_ends[idx],
+                    block="AM",
+                    day_index=day_index,
+                    date_value=date_value,
+                    section="cocktail",
+                    allow_cut=True,
+                    essential=False,
+                    cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+                    note="Cocktail AM",
+                )
+        if patio_target:
+            patio_am_end = min(frame["pm_start"], frame["am_end"] + datetime.timedelta(hours=1))
+            self._add_plan_entry(
+                plans,
+                role="Server - Patio",
+                start=frame["open_dt"],
+                end=patio_am_end,
+                block="AM",
+                day_index=day_index,
+                date_value=date_value,
+                section="patio",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["patio"],
+                note="Patio low-stay",
+            )
+
+        # PM dining staffing with preclose/closer ordering.
+        dining_closer_start = max(frame["pm_start"], frame["close_dt"] - datetime.timedelta(hours=5))
+        dining_pair = f"dining_closer:{day_index}"
+        self._add_plan_entry(
+            plans,
+            role="Server - Dining Closer",
+            start=dining_closer_start,
+            end=frame["close_dt"],
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="dining",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Dining closer (last out)",
+            pair_key=dining_pair,
+        )
+        # Close buffer job code for dining closer.
+        self._add_plan_entry(
+            plans,
+            role="Server - Dining Closer",
+            start=frame["close_dt"],
+            end=frame["close_end"],
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="dining",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Dining close buffer",
+            pair_key=dining_pair,
+        )
+        preclose_start_target = datetime.datetime.combine(date_value, datetime.time(hour=17), tzinfo=UTC)
+        preclose_start = max(frame["pm_start"], preclose_start_target)
+        preclose_end = min(frame["close_dt"] - datetime.timedelta(hours=2), preclose_start + datetime.timedelta(hours=4))
+        preclose_end = self._snap_datetime(preclose_end)
+        preclose_start = self._snap_datetime(preclose_start)
+        preclose_added = 0
+        if preclose_end > preclose_start:
+            self._add_plan_entry(
+                plans,
+                role="Server - Dining Preclose",
+                start=preclose_start,
+                end=preclose_end,
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="dining",
+                allow_cut=False,
+                essential=True,
+                cut_rank=GLOBAL_CUT_RANKS["preclose"],
+                note="Dining preclose",
+            )
+            preclose_added = 1
+        dining_pm_required = max(dining_pm, dining_am)
+        dining_general_pm = max(0, dining_pm_required - (1 + preclose_added))
+        pm_window = _preferred_window(
+            "Server - Dining",
+            "Servers",
+            "pm",
+            min_start=frame["pm_start"],
+            max_end=frame["close_dt"] - datetime.timedelta(minutes=60),
+            fallback=(frame["pm_start"], frame["close_dt"] - datetime.timedelta(minutes=60)),
+        )
+        pm_start_bound = max(frame["pm_start"], am_end_target)
+        pm_start_cap = am_end_target + datetime.timedelta(minutes=60)
+        pm_start_val = min(max(pm_window[0], pm_start_bound), pm_start_cap)
+        pm_window = (pm_start_val, pm_window[1])
+        if pm_window[0] < frame["pm_start"]:
+            pm_window = (frame["pm_start"], pm_window[1])
+        dining_pm_starts = _staggered_starts(pm_window[0], dining_general_pm)
+        for start_dt in dining_pm_starts:
+            if start_dt >= pm_window[1]:
+                continue
+            self._add_plan_entry(
+                plans,
+                role="Server - Dining",
+                start=start_dt,
+                end=pm_window[1],
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="dining",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["dining"],
+                note="Dining PM",
+            )
+
+        # PM cocktail staffing with preclose/closer ordering.
+        cocktail_closer_start = max(frame["pm_start"], frame["close_dt"] - datetime.timedelta(hours=4))
+        cocktail_pair = f"cocktail_closer:{day_index}"
+        self._add_plan_entry(
+            plans,
+            role="Server - Cocktail Closer",
+            start=cocktail_closer_start,
+            end=frame["close_dt"],
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="cocktail",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Cocktail closer (last out)",
+            pair_key=cocktail_pair,
+        )
+        self._add_plan_entry(
+            plans,
+            role="Server - Cocktail Closer",
+            start=frame["close_dt"],
+            end=frame["close_end"],
+            block="Close",
+            day_index=day_index,
+            date_value=date_value,
+            section="cocktail",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["closer"],
+            note="Cocktail close buffer",
+            pair_key=cocktail_pair,
+        )
+        cocktail_preclose_start = max(frame["pm_start"], preclose_start_target)
+        cocktail_preclose_end = min(frame["close_dt"] - datetime.timedelta(hours=2), cocktail_preclose_start + datetime.timedelta(hours=4))
+        cocktail_preclose_end = self._snap_datetime(cocktail_preclose_end)
+        cocktail_preclose_start = self._snap_datetime(cocktail_preclose_start)
+        preclose_cocktail_added = 0
+        if cocktail_preclose_end > cocktail_preclose_start:
+            self._add_plan_entry(
+                plans,
+                role="Server - Cocktail Preclose",
+                start=cocktail_preclose_start,
+                end=cocktail_preclose_end,
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="cocktail",
+                allow_cut=False,
+                essential=True,
+                cut_rank=GLOBAL_CUT_RANKS["preclose"],
+                note="Cocktail preclose",
+            )
+            preclose_cocktail_added = 1
+        cocktail_pm_required = max(cocktail_pm, cocktail_am)
+        cocktail_general_pm = max(0, cocktail_pm_required - (1 + preclose_cocktail_added))
+        cocktail_pm_starts = _staggered_starts(max(frame["pm_start"], pm_window[0]), cocktail_general_pm)
+        for start_dt in cocktail_pm_starts:
+            if start_dt >= pm_window[1]:
+                continue
+            self._add_plan_entry(
+                plans,
+                role="Server - Cocktail",
+                start=start_dt,
+                end=pm_window[1],
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="cocktail",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["cocktail"],
+                note="Cocktail PM",
+            )
+        if patio_target:
+            self._add_plan_entry(
+                plans,
+                role="Server - Patio",
+                start=frame["pm_start"],
+                end=frame["close_dt"] - datetime.timedelta(minutes=120),
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="patio",
+                allow_cut=True,
+                essential=False,
+                cut_rank=GLOBAL_CUT_RANKS["patio"],
+                note="Patio PM low-stay",
+            )
+        coverage.update(
+            {
+                "dining_am": dining_am,
+                "dining_pm": dining_pm_required,
+                "cocktail_am": cocktail_am,
+                "cocktail_pm": cocktail_pm_required,
+                "patio": patio_target,
+            }
+        )
+
+        # Cashiers with AM/PM blocks (adaptive start from templates + demand tier).
+        cashier_cfg = self.pre_engine_staffing.get("cashier", {})
+        am_cashiers = 1 if tier not in {"high", "peak"} else 2
+        pm_cashiers = 1
+        if tier == "moderate":
+            pm_cashiers = 2
+        elif tier == "high":
+            pm_cashiers = 2
+        elif tier == "peak":
+            pm_cashiers = min(3, int(cashier_cfg.get("peak", 3) or 3))
+        am_start, am_end = _cashier_window("am", min_start=frame["open_dt"], max_end=frame["am_end"])
+        for idx in range(am_cashiers):
+            self._add_plan_entry(
+                plans,
+                role="Cashier",
+                start=am_start,
+                end=am_end,
+                block="AM",
+                day_index=day_index,
+                date_value=date_value,
+                section="cashier",
+                allow_cut=idx > 0,
+                essential=idx == 0,
+                cut_rank=GLOBAL_CUT_RANKS["cashier"] + idx,
+                note="AM cashier coverage" if idx == 0 else ("AM To-Go" if idx == 1 else "AM Host"),
+            )
+        pm_end_cap = frame["close_dt"] - datetime.timedelta(minutes=max(30, self.close_buffer_minutes or 30))
+        pm_start, pm_end = _cashier_window("pm", min_start=frame["pm_start"], max_end=pm_end_cap)
+        for idx in range(pm_cashiers):
+            self._add_plan_entry(
+                plans,
+                role="Cashier",
+                start=pm_start,
+                end=pm_end,
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="cashier",
+                allow_cut=idx > 0,
+                essential=idx == 0,
+                cut_rank=GLOBAL_CUT_RANKS["cashier"] + idx,
+                note="PM cashier coverage" if idx == 0 else ("PM To-Go" if idx == 1 else "PM Host"),
+            )
+        coverage["cashier_am"] = am_cashiers
+        coverage["cashier_pm"] = pm_cashiers
+
+        # HOH sequencing and coverage (expo non-combinable).
+        # HOH opener job-code block (10:30-11:00) to satisfy required opener.
+        hoh_opener_pair = f"hoh_opener_expo:{day_index}"
+        self._add_plan_entry(
+            plans,
+            role="HOH - Opener",
+            start=frame["opener_start"],
+            end=frame["open_dt"],
+            block="Open",
+            day_index=day_index,
+            date_value=date_value,
+            section="hoh",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["hoh_sw"],
+            note="HOH opener buffer (pairs to expo)",
+            pair_key=hoh_opener_pair,
+        )
+        hoh_plans = self._hoh_sequence(frame)
+        for entry in hoh_plans:
+            self._add_plan_entry(
+                plans,
+                role=entry["role"],
+                start=entry["start"],
+                end=entry["end"],
+                block=entry.get("block", "Mid"),
+                day_index=day_index,
+                date_value=date_value,
+                section=entry.get("section"),
+                allow_cut=entry.get("allow_cut", True),
+                essential=entry.get("essential", False),
+                cut_rank=entry.get("cut_rank", GLOBAL_CUT_RANKS["hoh_chip_shake"]),
+                note="HOH sequence",
+            )
+        # Expo split into AM + PM waves (no all-day monolith).
+        expo_am_end_target = datetime.datetime.combine(date_value, datetime.time(hour=17), tzinfo=UTC)
+        expo_am_end = min(frame["am_end"], expo_am_end_target)
+        expo_pm_start_target = datetime.datetime.combine(date_value, datetime.time(hour=16), tzinfo=UTC)
+        expo_pm_start = max(frame["pm_start"], expo_pm_start_target)
+        expo_pm_end = min(frame["close_dt"], expo_pm_start + datetime.timedelta(hours=9))
+        self._add_plan_entry(
+            plans,
+            role="HOH - Expo",
+            start=frame["open_dt"],
+            end=expo_am_end,
+            block="AM",
+            day_index=day_index,
+            date_value=date_value,
+            section="hoh",
+            allow_cut=False,
+            essential=True,
+            cut_rank=GLOBAL_CUT_RANKS["expo"],
+            note="Expo AM (non-combinable)",
+            pair_key=hoh_opener_pair,
+        )
+        if expo_pm_end > expo_pm_start:
+            self._add_plan_entry(
+                plans,
+                role="HOH - Expo",
+                start=expo_pm_start,
+                end=expo_pm_end,
+                block="PM",
+                day_index=day_index,
+                date_value=date_value,
+                section="hoh",
+                allow_cut=False,
+                essential=True,
+                cut_rank=GLOBAL_CUT_RANKS["expo"],
+                note="Expo PM (non-combinable)",
+                pair_key=hoh_opener_pair,
+            )
+        coverage["hoh"] = len(hoh_plans) + 3  # opener + expo AM/PM
+        return plans, coverage
+
+    def _apply_bww_budget(self, plans: List[Dict[str, Any]]) -> None:
+        if not plans:
+            return
+        by_day: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for plan in plans:
+            by_day[plan.get("day_index", 0)].append(plan)
+        for day_index, bucket in by_day.items():
+            budget = self._day_budget(day_index)
+            if budget is None or budget <= 0:
+                continue
+            tolerance = 1.0 + self.labor_budget_tolerance
+            target_budget = budget * tolerance
+            cost = self._estimate_plan_cost(bucket)
+            if cost <= target_budget:
+                continue
+            self._trim_day_to_budget(bucket, cost, target_budget, day_index, plans)
+
+    def _day_budget(self, day_index: int) -> Optional[float]:
+        if 0 <= day_index < len(self.day_contexts):
+            ctx = self.day_contexts[day_index]
+            sales = float(ctx.get("sales", 0.0) or 0.0)
+            modifier = float(ctx.get("modifier_multiplier", 1.0) or 1.0)
+            return sales * modifier * self.labor_budget_pct
+        return None
+
+    def _estimate_plan_cost(self, bucket: List[Dict[str, Any]]) -> float:
+        total = 0.0
+        for plan in bucket:
+            start = plan.get("start")
+            end = plan.get("end")
+            if not isinstance(start, datetime.datetime) or not isinstance(end, datetime.datetime):
+                continue
+            hours = max(0.0, (end - start).total_seconds() / 3600)
+            rate = self._role_wage(plan.get("role"))
+            total += hours * rate
+        return round(total, 2)
+
+    def _trim_day_to_budget(
+        self,
+        bucket: List[Dict[str, Any]],
+        current_cost: float,
+        target_budget: float,
+        day_index: int,
+        plans_ref: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        candidates: List[Tuple[float, Dict[str, Any]]] = []
+        section_order = {"patio": 0, "cocktail": 1, "dining": 2, "cashier": 3, "hoh": 4, "bar": 5}
+        for plan in bucket:
+            if not plan.get("allow_cut", True) or plan.get("essential"):
+                continue
+            section = (plan.get("section") or "").lower()
+            weight = self._section_weight_value(section)
+            section_rank = section_order.get(section, 2.5)
+            cut_rank = plan.get("cut_rank", 5)
+            score = (section_rank, cut_rank, weight)
+            candidates.append((score, plan))
+        candidates.sort(key=lambda item: item[0])
+        cost = current_cost
+        for _score, plan in candidates:
+            if cost <= target_budget:
+                break
+            saved = self._estimate_plan_cost([plan])
+            try:
+                bucket.remove(plan)
+            except ValueError:
+                continue
+            if plans_ref is not None:
+                try:
+                    plans_ref.remove(plan)
+                except ValueError:
+                    pass
+            cost -= saved
+            self.cut_insights.append(
+                {
+                    "day_index": day_index,
+                    "role": plan.get("role"),
+                    "saved": round(saved, 2),
+                    "reason": "budget_trim",
+                }
+            )
+            self.warnings.append(
+                f"Forced cut {plan.get('role')} on {plan.get('date')} ({plan.get('block')}) to respect budget."
+            )
+        if cost > target_budget:
+            self.warnings.append(
+                f"Budget overrun on {self._day_label(day_index)} after cuts (cost {cost:.2f} vs target {target_budget:.2f})."
+            )
+
+    def _section_weight_value(self, section: Optional[str]) -> float:
+        label = (section or "").lower()
+        if label == "patio":
+            return float(self.section_weights.get("patio", 0.5))
+        if label == "cocktail":
+            return float(self.section_weights.get("cocktail", 0.7))
+        if label == "dining":
+            return float(self.section_weights.get("dining", 1.0))
+        return 1.0
+
+    def _apply_plan_manager_fallback(self, demand: BlockDemand, payload: Dict[str, Any]) -> bool:
+        """Apply a manager fallback override for a plan flagged before assignment."""
+        role_norm = normalize_role(demand.role)
+        # Never allow fallback for openers/closers or disallowed roles/groups.
+        if "opener" in role_norm or "closer" in role_norm:
+            return False
+        if any(dis in role_norm for dis in self.manager_fallback_disallow):
+            return False
+        period = "am" if demand.start.hour < 15 else "pm"
+        if self.manager_fallback_counts.get(demand.day_index, {}).get(period, 0) >= self.manager_fallback_limits.get(
+            period, 0
+        ):
+            return False
+        self.manager_fallback_counts[demand.day_index][period] += 1
+        max_end = demand.start + datetime.timedelta(hours=4)
+        if payload.get("end") and payload["end"] > max_end:
+            payload["end"] = self._snap_datetime(max_end)
+        payload["employee_id"] = None
+        payload["labor_rate"] = 0.0
+        payload["labor_cost"] = 0.0
+        payload["notes"] = self._append_note(payload.get("notes"), self.manager_fallback_tag)
+        payload["_manager_fallback"] = True
+        self.warnings.append(
+            f"MGR-FOH fallback assigned to {demand.role} on {demand.date.isoformat()} "
+            f"{demand.start.strftime('%H:%M')}-{demand.end.strftime('%H:%M')} (pre-budget)."
+        )
+        return True
+
+    def _refine_assignments(self, assignments: List[Dict[str, Any]]) -> None:
+        """Second pass: trim optional shifts to hit per-day budgets using cut ranks/sections."""
+        if not assignments:
+            return
+        by_day: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for shift in assignments:
+            if not isinstance(shift.get("start"), datetime.datetime):
+                continue
+            day_key = shift["start"].date().isoformat()
+            by_day[day_key].append(shift)
+        for day_key, bucket in by_day.items():
+            # Compute budget for the day.
+            date_obj = datetime.date.fromisoformat(day_key)
+            day_index = date_obj.weekday()
+            budget = self._day_budget(day_index)
+            if budget is None or budget <= 0:
+                continue
+            target = budget * (1.0 + self.labor_budget_tolerance)
+            current = sum(shift.get("labor_cost", 0.0) for shift in bucket)
+            if current <= target:
+                continue
+            candidates: List[Dict[str, Any]] = []
+            for shift in bucket:
+                if not shift.get("end") or not shift.get("start"):
+                    continue
+                if not shift.get("_cut_rank") and shift.get("_cut_rank") != 0:
+                    shift["_cut_rank"] = 50
+                if shift.get("_essential") or shift.get("location", "").lower() in {"open", "close"}:
+                    continue
+                if not shift.get("allow_cut", shift.get("_allow_cut", True)):
+                    continue
+                candidates.append(shift)
+            candidates.sort(key=lambda s: (s.get("_cut_rank", 50), s.get("end")))
+            for shift in candidates:
+                if current <= target:
+                    break
+                start_dt = shift["start"]
+                end_dt = shift["end"]
+                role_name = shift.get("role", "")
+                group = role_group(role_name)
+                min_hours, _ = shift_length_limits(self.policy, role_name, group)
+                min_duration = datetime.timedelta(hours=min_hours)
+                proposed_end = end_dt - datetime.timedelta(minutes=30)
+                if proposed_end - start_dt < min_duration:
+                    continue
+                shift["end"] = self._snap_datetime(proposed_end)
+                duration_hours = max(0.0, (shift["end"] - shift["start"]).total_seconds() / 3600)
+                shift["labor_cost"] = round(duration_hours * shift.get("labor_rate", 0.0), 2)
+                current = sum(s.get("labor_cost", 0.0) for s in bucket)
+                self.cut_insights.append(
+                    {
+                        "day_index": day_index,
+                        "role": role_name,
+                        "saved": round(target - current, 2) if current < target else 0.0,
+                        "reason": "refine_budget_cut",
+                    }
+                )
+            if current > target:
+                self.warnings.append(
+                    f"Budget overrun on {day_key} after refine pass (cost {current:.2f} vs target {target:.2f})."
+                )
+
+    def _assign_from_plans(self, plans: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        assignments: List[Dict[str, Any]] = []
+        self.unfilled_slots = []
+        pair_map: Dict[str, Optional[int]] = {}
+        for plan in sorted(plans, key=lambda p: (p.get("day_index", 0), p.get("start"), p.get("end"))):
+            demand = BlockDemand(
+                day_index=plan.get("day_index", 0),
+                date=plan.get("date"),
+                start=plan.get("start"),
+                end=plan.get("end"),
+                role=plan.get("role"),
+                block_name=plan.get("block", "Mid"),
+                labels=[plan.get("block", "Mid")],
+                need=1,
+                priority=1.0,
+                minimum=1,
+                allow_cuts=plan.get("allow_cut", True),
+                always_on=plan.get("essential", False),
+                role_group=plan.get("role_group") or self._canonical_group(role_group(plan.get("role"))),
+                hourly_rate=self._role_wage(plan.get("role")),
+            )
+            demand.recommended_cut = plan.get("end")
+            pair_key = plan.get("_pair_key")
+            if pair_key and pair_key in pair_map:
+                emp_id = pair_map[pair_key]
+                candidate = self.employee_lookup.get(emp_id) if emp_id else None
+            else:
+                candidate = None if plan.get("force_manager_fallback") else self._select_employee(demand)
+                # Hard-stop fallback for required HOH opener: if no exact match, allow any kitchen-capable employee.
+                if not candidate and "hoh - opener" in normalize_role(demand.role):
+                    candidate = self._select_any_kitchen(demand)
+            if candidate:
+                if role_group(demand.role) == "Cashier" and self._is_management_only(candidate):
+                    candidate = None
+                else:
+                    self._register_assignment(candidate, demand)
+            if pair_key:
+                pair_map[pair_key] = candidate.get("id") if candidate and isinstance(candidate, dict) else (
+                    candidate if isinstance(candidate, int) else None
+                )
+            payload = self._build_assignment_payload(candidate if candidate else None, demand, override_end=plan.get("end"))
+            payload["location"] = plan.get("block", "Mid")
+            if plan.get("note"):
+                payload["notes"] = self._append_note(payload.get("notes"), plan["note"])
+            if plan.get("essential"):
+                payload["notes"] = self._append_note(payload.get("notes"), "Required coverage")
+            payload["_section"] = plan.get("section")
+            payload["_block"] = plan.get("block")
+            payload["_cut_rank"] = plan.get("cut_rank", 0)
+            if plan.get("force_manager_fallback") and not candidate:
+                if self._apply_plan_manager_fallback(demand, payload):
+                    assignments.append(payload)
+                    continue
+            assignments.append(payload)
+            if not candidate:
+                self.unfilled_slots.append({"payload": payload, "demand": demand})
+        return assignments
 
     def _roles_by_group(self) -> Dict[str, List[str]]:
         mapping: Dict[str, List[str]] = defaultdict(list)
@@ -1814,15 +3261,20 @@ class ScheduleGenerator:
         normalized_role = normalize_role(role_name)
         if not normalized_role:
             return False
+        if "opener" in normalized_role:
+            return True
         allowed = {
             "kitchen opener",
             "bartender",
             "bartender - opener",
+            "hoh - opener",
+            "hoh - expo opener",
             "server",
             "server - dining",
             "server - dining opener",
             "server - cocktail",
             "server - cocktail opener",
+            "server - opener",
         }
         return normalized_role in allowed
 
@@ -2637,6 +4089,8 @@ class ScheduleGenerator:
         if not self.manager_fallback_allowed:
             return False
         role_norm = normalize_role(demand.role)
+        if role_group(demand.role) == "Cashier":
+            return False
         if any(token in role_norm for token in self.manager_fallback_disallow):
             return False
         if "bartender" in role_norm or "expo" in role_norm or "opener" in role_norm or "closer" in role_norm:
@@ -2647,6 +4101,9 @@ class ScheduleGenerator:
         ):
             return False
         self.manager_fallback_counts[demand.day_index][period] += 1
+        max_end = demand.start + datetime.timedelta(hours=4)
+        if payload.get("end") and payload["end"] > max_end:
+            payload["end"] = self._snap_datetime(max_end)
         payload["employee_id"] = None
         payload["labor_rate"] = 0.0
         payload["labor_cost"] = 0.0
@@ -2666,11 +4123,25 @@ class ScheduleGenerator:
     ) -> None:
         start_dt = payload.get("start", demand.start)
         end_dt = payload.get("end", demand.end)
+        day_start = datetime.datetime.combine(demand.date, datetime.time.min, tzinfo=UTC)
+        close_dt = day_start + datetime.timedelta(minutes=close_minutes(self.policy, demand.date))
+        if close_dt <= start_dt:
+            close_dt = close_dt + datetime.timedelta(days=1)
+        buffer_cap = max(30, self.close_buffer_minutes or 30)
+        hard_cap = close_dt - datetime.timedelta(minutes=buffer_cap)
+        evening_cap = datetime.datetime.combine(demand.date, datetime.time(hour=20), tzinfo=UTC)
+        end_cap = min(hard_cap, evening_cap)
+        filler_end = min(end_dt, start_dt + datetime.timedelta(hours=3), end_cap)
+        min_filler_end = start_dt + datetime.timedelta(hours=1)
+        if filler_end < min_filler_end:
+            filler_end = min(min_filler_end, end_cap)
+        if filler_end <= start_dt:
+            return
         adjusted = BlockDemand(
             day_index=demand.day_index,
             date=demand.date,
             start=start_dt,
-            end=end_dt,
+            end=filler_end,
             role=demand.role,
             block_name=demand.block_name,
             labels=list(demand.labels),
@@ -2682,14 +4153,15 @@ class ScheduleGenerator:
             role_group=demand.role_group,
             hourly_rate=demand.hourly_rate,
         )
-        adjusted.recommended_cut = end_dt
+        adjusted.recommended_cut = filler_end
         adjusted.max_capacity = 1
         self._register_assignment(employee, adjusted)
         rate = self._employee_role_wage(employee, demand.role)
         payload["employee_id"] = employee.get("id")
         payload["labor_rate"] = rate
-        payload["labor_cost"] = self._compute_cost(start_dt, end_dt, rate)
-        payload["notes"] = self._append_note(payload.get("notes"), "Recovered coverage")
+        payload["end"] = filler_end
+        payload["labor_cost"] = self._compute_cost(start_dt, filler_end, rate)
+        payload["notes"] = self._append_note(payload.get("notes"), "Recovered coverage (short filler)")
 
     def _apply_staggered_cuts_for_demand(
         self,
@@ -2944,13 +4416,34 @@ class ScheduleGenerator:
                 covers = link.get("covers") or set()
                 role_group = link.get("role_group")
                 if normalized_role not in covers and demand.role_group != role_group:
-                    continue
+                    # Allow HOH - All Roles to satisfy any kitchen opener/cover need.
+                    if not (
+                        role_group == "Kitchen"
+                        and any(normalize_role(role) == normalize_role("HOH - All Roles") for role in employee.get("roles", []))
+                    ):
+                        continue
                 existing = matches.get(employee["id"])
                 if existing is None or target_start < existing[0]:
                     matches[employee["id"]] = (target_start, employee)
                 break
         ordered = sorted(matches.values(), key=lambda entry: (entry[0], entry[1]["id"]))
         return [entry[1] for entry in ordered]
+
+    def _select_any_kitchen(self, demand: BlockDemand) -> Optional[Dict[str, Any]]:
+        """Fallback selection: any kitchen-capable employee for required HOH coverage."""
+        best = None
+        best_score = float("inf")
+        for employee in self.employees:
+            roles = employee.get("roles", set())
+            if not any(role_group(r) == "Kitchen" or normalize_role(r) == normalize_role("HOH - All Roles") for r in roles):
+                continue
+            if not self._employee_available(employee, demand, allow_desired_overflow=True):
+                continue
+            load = len(employee["assignments"].get(demand.day_index, []))
+            if load < best_score:
+                best_score = load
+                best = employee
+        return best
 
     def _employee_can_cover_role(self, employee: Dict[str, Any], role_name: str) -> bool:
         if not role_name:
@@ -2964,10 +4457,29 @@ class ScheduleGenerator:
                 continue
             if candidate_group == "Management" and target_group in {"Servers", "Bartenders"}:
                 continue
-            if target_group == "Kitchen" and candidate_group not in {"Kitchen"}:
-                # Allow explicit cross-train only if the employee has the exact role.
-                if not role_matches(candidate, role_name):
+            if target_group == "Cashier" and candidate_group == "Management":
+                continue
+            if target_group == "Cashier":
+                # Allow explicit all-roles cashier or any cashier-group role/covers.
+                if candidate_group == "Management":
                     continue
+                if normalize_role(candidate) == normalize_role("Cashier - All Roles"):
+                    return True
+                if candidate_group == "Cashier":
+                    return True
+                candidate_cfg = role_definition(self.policy, candidate)
+                covers = candidate_cfg.get("covers") if isinstance(candidate_cfg, dict) else []
+                if covers and any(role_matches(cover, role_name) for cover in covers):
+                    return True
+                continue
+            if target_group == "Kitchen":
+                if candidate_group not in {"Kitchen"}:
+                    # Allow explicit cross-train only if the employee has the exact role.
+                    if not role_matches(candidate, role_name):
+                        continue
+                # HOH - All Roles can satisfy any kitchen role (including opener).
+                if normalize_role(candidate) == normalize_role("HOH - All Roles"):
+                    return True
             if target_group in {"Servers", "Bartenders"} and candidate_group == "Kitchen":
                 if not role_matches(candidate, role_name):
                     continue
@@ -2977,12 +4489,6 @@ class ScheduleGenerator:
             covers = candidate_cfg.get("covers") if isinstance(candidate_cfg, dict) else []
             if covers and role_name in covers:
                 return True
-        if target_group == "Cashier":
-            # Cashier can be covered by Servers/Bartenders/Managers when explicitly assigned.
-            for candidate in candidate_roles:
-                candidate_group = role_group(candidate)
-                if candidate_group in {"Servers", "Bartenders", "Management"}:
-                    return True
         if target_group and target_group in self.interchangeable_groups:
             for candidate in candidate_roles:
                 if role_group(candidate) == target_group:
@@ -2995,6 +4501,12 @@ class ScheduleGenerator:
                     if role_matches(candidate, qualifier):
                         return True
         return False
+
+    def _is_management_only(self, employee: Dict[str, Any]) -> bool:
+        roles = employee.get("roles") or []
+        if not roles:
+            return False
+        return all(role_group(role) == "Management" for role in roles)
 
     def _employee_available(
         self,
@@ -3030,6 +4542,20 @@ class ScheduleGenerator:
                 return False
         except (TypeError, ValueError):
             pass
+        day_minutes = sum(end - start for start, end in employee["assignments"][demand.day_index])
+        day_hours = day_minutes / 60.0
+        day_meta = (employee.get("day_meta") or {}).get(demand.day_index, [])
+        has_non_close = any((entry.get("location") or "").strip().lower() not in {"close"} for entry in day_meta)
+        is_closer_block = self._is_closer_block(demand.role, demand.block_name) or demand.block_name.strip().lower() == "close"
+        if self.max_hours_per_day > 0:
+            proposed_day_hours = day_hours + block_hours
+            if is_closer_block:
+                # Allow close + buffer stacking, but block adding closes on top of day shifts that exceed daily cap.
+                if has_non_close and proposed_day_hours > self.max_hours_per_day:
+                    return False
+            else:
+                if proposed_day_hours > self.max_hours_per_day:
+                    return False
         desired_ceiling = employee.get("desired_ceiling")
         if (
             not allow_desired_overflow
@@ -3143,6 +4669,14 @@ class ScheduleGenerator:
         employee["day_last_block_end"][demand.day_index] = end_minutes
         employee["total_hours"] += demand.duration_hours
         employee["last_assignment_end"] = demand.end
+        if "day_meta" in employee:
+            employee["day_meta"][demand.day_index].append(
+                {
+                    "location": (demand.block_name or "").strip(),
+                    "role": demand.role,
+                    "group": demand.role_group,
+                }
+            )
         if demand.day_index not in employee["days_with_assignments"]:
             last_day = employee.get("last_day_index")
             if last_day is not None and demand.day_index == last_day + 1:
@@ -3216,6 +4750,27 @@ class ScheduleGenerator:
         """
         if not assignments:
             return
+        # Drop exact duplicates (same employee, role, start/end, location).
+        unique: List[Dict[str, Any]] = []
+        seen_keys: Set[Tuple[Any, str, datetime.datetime, datetime.datetime, str]] = set()
+        for payload in assignments:
+            start_dt = payload.get("start")
+            end_dt = payload.get("end")
+            if not isinstance(start_dt, datetime.datetime) or not isinstance(end_dt, datetime.datetime):
+                unique.append(payload)
+                continue
+            key = (
+                payload.get("employee_id"),
+                payload.get("role"),
+                start_dt,
+                end_dt,
+                (payload.get("location") or "").lower(),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            unique.append(payload)
+        assignments[:] = unique
         tolerance = datetime.timedelta(minutes=max(5, self.round_to_minutes))
         grouped: Dict[Tuple[Any, str, datetime.date], List[Dict[str, Any]]] = defaultdict(list)
         for payload in assignments:
@@ -3228,7 +4783,7 @@ class ScheduleGenerator:
             shifts.sort(key=lambda s: s["start"])
             current = shifts[0]
             for nxt in shifts[1:]:
-                if nxt["start"] <= current["end"] + tolerance:
+                if nxt["start"] <= current["end"] + tolerance and (current.get("location") == nxt.get("location")):
                     current["end"] = max(current["end"], nxt["end"])
                     current["labor_cost"] = self._compute_cost(
                         current["start"], current["end"], current.get("labor_rate", 0.0)
@@ -3245,6 +4800,42 @@ class ScheduleGenerator:
             merged.append(current)
         assignments.clear()
         assignments.extend(merged)
+
+    def _normalize_bartender_openers(self, assignments: List[Dict[str, Any]]) -> None:
+        """Force bartender opener to 10:30-11:00 window to avoid template drift."""
+        if not assignments or not self.day_contexts:
+            return
+        opener_map: Dict[datetime.date, Tuple[datetime.datetime, datetime.datetime]] = {}
+        for ctx in self.day_contexts:
+            opener_map[ctx.get("date")] = (ctx.get("opener_start"), ctx.get("open_dt"))
+        seen: Set[Tuple[datetime.date, int]] = set()
+        garbage: List[Dict[str, Any]] = []
+        for shift in assignments:
+            role_norm = normalize_role(shift.get("role", ""))
+            if role_norm != normalize_role("Bartender - Opener"):
+                continue
+            start = shift.get("start")
+            if not isinstance(start, datetime.datetime):
+                continue
+            forced = opener_map.get(start.date())
+            if not forced or not all(forced):
+                continue
+            key = (start.date(), shift.get("employee_id") or -1)
+            if key in seen:
+                garbage.append(shift)
+                continue
+            seen.add(key)
+            forced_start, forced_end = forced
+            shift["start"] = self._snap_datetime(forced_start)
+            shift["end"] = self._snap_datetime(forced_end)
+            shift["labor_cost"] = self._compute_cost(shift["start"], shift["end"], shift.get("labor_rate", 0.0))
+            shift["notes"] = self._append_note(shift.get("notes"), "Opener fixed 10:30-11:00")
+        if garbage:
+            for dead in garbage:
+                try:
+                    assignments.remove(dead)
+                except ValueError:
+                    pass
 
     def _ensure_opener_followups(
         self,
@@ -3369,9 +4960,28 @@ class ScheduleGenerator:
                     continue
                 op_day = self._closer_operational_day_index(week_start, shift["start"])
                 closer_group = role_group(shift.get("role"))
+                # Skip continuity if this close block directly follows another close segment for the same employee
+                # (e.g., the short close buffer that follows the main bartender closer).
+                if any(
+                    other is not shift
+                    and other.get("employee_id") == emp_id
+                    and (other.get("location") or "").strip().lower() == "close"
+                    and (not closer_group or role_group(other.get("role")) == closer_group)
+                    and isinstance(other.get("end"), datetime.datetime)
+                    and isinstance(shift.get("start"), datetime.datetime)
+                    and abs(other["end"] - shift["start"]) <= tolerance
+                    for other in day_map.get(op_day, [])
+                ):
+                    continue
                 if self._closer_has_prior_assignment(
                     emp_id, shift["start"], day_map.get(op_day, []), tolerance, closer_group
                 ):
+                    continue
+                closer_duration_hours = 0.0
+                if isinstance(shift.get("start"), datetime.datetime) and isinstance(shift.get("end"), datetime.datetime):
+                    closer_duration_hours = max(0.0, (shift["end"] - shift["start"]).total_seconds() / 3600)
+                if closer_group == "Bartenders" and closer_duration_hours >= 6.0:
+                    # Already a substantial PM closer block; skip auto lead-in.
                     continue
                 if self._pair_closer_with_existing(emp_id, shift, day_map.get(op_day, []), tolerance):
                     continue
@@ -3450,6 +5060,17 @@ class ScheduleGenerator:
             return
         min_hours, _ = shift_length_limits(self.policy, role_name, role_group(role_name))
         duration = datetime.timedelta(hours=max(2.5, min_hours))
+        if self.max_hours_per_day > 0:
+            close_hours = max(
+                0.0,
+                (close_shift.get("end") - close_shift.get("start")).total_seconds() / 3600
+                if isinstance(close_shift.get("end"), datetime.datetime) and isinstance(close_shift.get("start"), datetime.datetime)
+                else 0.0,
+            )
+            allowed_extra = max(0.0, self.max_hours_per_day - close_hours)
+            duration = datetime.timedelta(hours=min(duration.total_seconds() / 3600, allowed_extra))
+        if duration <= datetime.timedelta(minutes=1):
+            return
         start_dt = close_shift["start"] - duration
         payload = self._create_manual_shift(
             employee_id,
@@ -3462,6 +5083,51 @@ class ScheduleGenerator:
         payload["_followup_locked"] = True
         assignments.append(payload)
         day_map[op_day_index].append(payload)
+
+    def _force_bartender_opener_pair(self, assignments: List[Dict[str, Any]]) -> None:
+        """Ensure bartender opener continues into the opener-follow shift (all days)."""
+        tolerance = datetime.timedelta(minutes=max(5, self.round_to_minutes))
+        by_date: Dict[datetime.date, List[Dict[str, Any]]] = defaultdict(list)
+        for payload in assignments:
+            start_dt = payload.get("start")
+            if isinstance(start_dt, datetime.datetime):
+                by_date[start_dt.date()].append(payload)
+        for shifts in by_date.values():
+            for opener in list(shifts):
+                if normalize_role(opener.get("role", "")) != normalize_role("Bartender - Opener"):
+                    continue
+                emp_id = opener.get("employee_id")
+                opener_end = opener.get("end")
+                if not emp_id or not isinstance(opener_end, datetime.datetime):
+                    continue
+                candidates: List[Dict[str, Any]] = []
+                for candidate in shifts:
+                    if candidate is opener:
+                        continue
+                    if (candidate.get("location") or "").strip().lower() in {"open", "close"}:
+                        continue
+                    role_norm = normalize_role(candidate.get("role", ""))
+                    if "bartender" not in role_norm:
+                        continue
+                    start_dt = candidate.get("start")
+                    if not isinstance(start_dt, datetime.datetime):
+                        continue
+                    if start_dt < opener_end - tolerance:
+                        continue
+                    candidates.append(candidate)
+                if not candidates:
+                    continue
+                candidates.sort(
+                    key=lambda payload: (
+                        0 if "opener follow" in (payload.get("notes", "").lower()) else 1,
+                        payload.get("start"),
+                    )
+                )
+                follow = candidates[0]
+                follow["_followup_locked"] = True
+                if follow.get("employee_id") == emp_id:
+                    continue
+                self._transfer_shift_employee(follow, emp_id, tag="Opener continuity")
 
     def _transfer_shift_employee(self, shift: Dict[str, Any], new_employee_id: Optional[int], *, tag: str) -> None:
         old_employee_id = shift.get("employee_id")
@@ -3525,44 +5191,89 @@ class ScheduleGenerator:
         cocktail_cfg = server_cfg.get("cocktail", {})
         cashier_cfg = self.pre_engine_staffing.get("cashier", {})
         for day_index in range(7):
-            demand_index = 1.0
-            ctx_date = None
-            if 0 <= day_index < len(self.day_contexts):
-                demand_index = self.day_contexts[day_index].get("indices", {}).get("demand_index", 1.0)
-                ctx_date = self.day_contexts[day_index].get("date")
-            tier = self._volume_tier(demand_index)
-            dining_count = self._count_roles_for_day(
+            ctx = self.day_contexts[day_index] if 0 <= day_index < len(self.day_contexts) else {}
+            ctx_date = ctx.get("date")
+            adjusted_sales = float(ctx.get("adjusted_sales", 0.0) or 0.0)
+            demand_index = ctx.get("indices", {}).get("demand_index", 1.0)
+            tier = ctx.get("tier") or self._volume_tier(demand_index, adjusted_sales)
+            day_label = ctx_date or self._day_label(day_index)
+
+            dining_am_target, dining_pm_target = self._resolve_server_targets(tier, "dining")
+            dining_target = max(dining_am_target, dining_pm_target)
+            dining_peak = int(dining_cfg.get("peak", max(dining_target, 6)) or max(dining_target, 6))
+            dining_manual = int(dining_cfg.get("manual_max", max(dining_peak, dining_target)) or max(dining_peak, dining_target))
+            dining_slow_min = int(dining_cfg.get("slow_min", 1) or 1)
+            dining_slow_max = int(dining_cfg.get("slow_max", max(dining_slow_min, 4)) or max(dining_slow_min, 4))
+            dining_moderate = int(dining_cfg.get("moderate", max(dining_target, 2)) or max(dining_target, 2))
+
+            dining_count = self._max_concurrent(
                 assignments, day_index, lambda name: "server" in name and "cocktail" not in name and "patio" not in name
             )
-            cocktail_count = self._count_roles_for_day(assignments, day_index, lambda name: "cocktail" in name)
-            cashier_count = self._count_roles_for_day(assignments, day_index, lambda name: "cashier" in name or "host" in name)
-            if tier == "slow" and dining_count > int(dining_cfg.get("slow_max", 4)):
+            cocktail_count = self._max_concurrent(assignments, day_index, lambda name: "cocktail" in name)
+            cashier_count = self._max_concurrent(assignments, day_index, lambda name: "cashier" in name or "host" in name)
+            # Dining checks
+            if dining_count <= 0:
+                self.errors.append(f"Dining staffing missing on {day_label}.")
+            if dining_count > dining_manual:
                 self.warnings.append(
-                    f"Dining staffing {dining_count} exceeds slow cap ({dining_cfg.get('slow_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                    f"Dining staffing {dining_count} exceeds manual override threshold ({dining_manual}) on {day_label}."
                 )
-            if tier in {"moderate", "peak"} and dining_count < int(dining_cfg.get("slow_min", 1)):
-                self.errors.append(f"Dining staffing below minimum on {ctx_date or self._day_label(day_index)}.")
-            manual_dining = int(dining_cfg.get("manual_max", 7))
-            if manual_dining and dining_count > manual_dining:
+            if tier in {"low", "slow"}:
+                if dining_count < dining_slow_min:
+                    self.errors.append(f"Dining staffing below slow minimum ({dining_slow_min}) on {day_label}.")
+                if dining_count > dining_slow_max:
+                    self.warnings.append(
+                        f"Dining staffing {dining_count} exceeds slow cap ({dining_slow_max}) on {day_label}."
+                    )
+            elif tier == "moderate":
+                if dining_count < dining_moderate:
+                    self.warnings.append(
+                        f"Dining staffing {dining_count} below moderate target ({dining_moderate}) on {day_label}."
+                    )
+            else:  # high / peak
+                if dining_count < dining_peak:
+                    self.warnings.append(
+                        f"Dining staffing {dining_count} below peak target ({dining_peak}) on {day_label}."
+                    )
+
+            # Cocktail checks
+            ct_am_target, ct_pm_target = self._resolve_server_targets(tier, "cocktail")
+            cocktail_target = max(ct_am_target, ct_pm_target)
+            cocktail_manual = int(cocktail_cfg.get("manual_max", max(int(cocktail_cfg.get("peak", cocktail_target) or cocktail_target), cocktail_target)) or cocktail_target)
+            cocktail_low_target = max(
+                1, min(int(cocktail_cfg.get("normal", 2) or 2), int(cocktail_cfg.get("busy", cocktail_target) or cocktail_target))
+            )
+            cocktail_peak_target = int(cocktail_cfg.get("peak", max(cocktail_target, 4)) or max(cocktail_target, 4))
+
+            if cocktail_count <= 0:
+                self.errors.append(f"Cocktail staffing missing on {day_label}.")
+            if cocktail_count > cocktail_manual:
                 self.warnings.append(
-                    f"Dining staffing {dining_count} exceeds manual override threshold ({manual_dining}) on {ctx_date or self._day_label(day_index)}."
+                    f"Cocktail staffing {cocktail_count} requires manual override (>{cocktail_manual}) on {day_label}."
                 )
-            if tier == "peak" and dining_count < int(dining_cfg.get("peak", 6)):
+            if tier in {"low", "slow"} and cocktail_count < cocktail_low_target:
+                self.errors.append(
+                    f"Cocktail staffing below minimum ({cocktail_low_target}) on {day_label}."
+                )
+            if tier in {"high", "peak"} and cocktail_count < cocktail_peak_target:
                 self.warnings.append(
-                    f"Dining staffing below peak target ({dining_cfg.get('peak', 6)}) on {ctx_date or self._day_label(day_index)}."
+                    f"Cocktail staffing {cocktail_count} below peak target ({cocktail_peak_target}) on {day_label}."
                 )
-            if tier == "peak" and cocktail_count > int(cocktail_cfg.get("manual_max", 4)):
+
+            # Cashier checks
+            cashier_manual = int(cashier_cfg.get("manual_max", 4) or 4)
+            tier_cashier_target = {"low": 1, "slow": 1, "moderate": 2, "high": 3, "peak": 3}.get(tier, 1)
+            base_min_cashier = 1
+            if cashier_count < base_min_cashier:
+                self.errors.append(f"Cashier coverage missing on {day_label}.")
+            elif cashier_count < tier_cashier_target:
                 self.warnings.append(
-                    f"Cocktail staffing {cocktail_count} requires manual override (>{cocktail_cfg.get('manual_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                    f"Cashier staffing {cashier_count} below target ({tier_cashier_target}) on {day_label}."
                 )
-            if tier == "slow" and cocktail_count < int(cocktail_cfg.get("normal", 2)):
-                self.errors.append(f"Cocktail staffing below normal ({cocktail_cfg.get('normal', 2)}) on {ctx_date or self._day_label(day_index)}.")
-            if cashier_count > int(cashier_cfg.get("manual_max", 4)):
+            if cashier_count > cashier_manual:
                 self.warnings.append(
-                    f"Cashier staffing {cashier_count} exceeds manual override threshold ({cashier_cfg.get('manual_max', 4)}) on {ctx_date or self._day_label(day_index)}."
+                    f"Cashier staffing {cashier_count} exceeds manual override threshold ({cashier_manual}) on {day_label}."
                 )
-            if cashier_count < int(cashier_cfg.get("am_default", 1)):
-                self.errors.append(f"Cashier coverage missing on {ctx_date or self._day_label(day_index)}.")
 
     def _record_required_role_gaps(self, assignments: List[Dict[str, Any]]) -> None:
         if not self.required_role_labels:
@@ -3590,6 +5301,34 @@ class ScheduleGenerator:
                 count += 1
         return count
 
+    def _max_concurrent(
+        self, assignments: List[Dict[str, Any]], day_index: int, predicate: Callable[[str], bool]
+    ) -> int:
+        events: List[Tuple[datetime.datetime, int]] = []
+        for shift in assignments:
+            if self._day_index_for_shift(shift) != day_index:
+                continue
+            start = shift.get("start")
+            end = shift.get("end")
+            role_name = (shift.get("role") or "").lower()
+            if not isinstance(start, datetime.datetime) or not isinstance(end, datetime.datetime):
+                continue
+            if "training" in role_name:
+                continue
+            if not predicate(role_name):
+                continue
+            events.append((start, 1))
+            events.append((end, -1))
+        if not events:
+            return 0
+        events.sort(key=lambda e: (e[0], e[1]))
+        current = 0
+        peak = 0
+        for _ts, delta in events:
+            current += delta
+            peak = max(peak, current)
+        return peak
+
     def _day_index_for_shift(self, shift: Dict[str, Any]) -> int:
         start_date = shift.get("start").date() if isinstance(shift.get("start"), datetime.datetime) else None
         for ctx in self.day_contexts:
@@ -3597,16 +5336,14 @@ class ScheduleGenerator:
                 return ctx.get("day_index", start_date.weekday() if start_date else 0)
         return start_date.weekday() if start_date else 0
 
-    def _volume_tier(self, demand_index: float) -> str:
-        try:
-            slow_max = float(self.volume_thresholds.get("slow_max", 0.45))
-            moderate_max = float(self.volume_thresholds.get("moderate_max", 0.75))
-        except Exception:  # noqa: BLE001
-            slow_max, moderate_max = 0.45, 0.75
-        if demand_index <= slow_max:
-            return "slow"
-        if demand_index <= moderate_max:
+    def _volume_tier(self, demand_index: float, adjusted_sales: float = 0.0) -> str:
+        # Dev-side absolute sales classification for BWW Rolla.
+        if adjusted_sales <= 5000:
+            return "low"
+        if adjusted_sales <= 9000:
             return "moderate"
+        if adjusted_sales <= 12500:
+            return "high"
         return "peak"
 
     def _build_assignment_payload(
@@ -3659,6 +5396,21 @@ class ScheduleGenerator:
                     continue
                 total_budget += sum(float(value) for value in day_budget.values())
         budget_ratio = total_cost / total_budget if total_budget > 1e-6 else None
+        employee_hours: Dict[str, float] = defaultdict(float)
+        coverage_map: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for shift in shifts:
+            emp_id = shift.get("employee_id")
+            if emp_id is None:
+                continue
+            duration = (
+                (shift["end"] - shift["start"]).total_seconds() / 3600 if shift.get("end") and shift.get("start") else 0
+            )
+            employee_hours[str(emp_id)] += round(duration, 2)
+            date_key = shift["start"].date().isoformat() if isinstance(shift.get("start"), datetime.datetime) else None
+            section_label = (shift.get("_section") or role_group(shift.get("role")) or "other").lower()
+            if date_key:
+                coverage_map[date_key][section_label] += 1
+        coverage = [{"date": date_key, **sections} for date_key, sections in sorted(coverage_map.items())]
         return {
             "week_id": week.id,
             "days": totals,
@@ -3668,6 +5420,8 @@ class ScheduleGenerator:
             "policy_budget_ratio": round(budget_ratio, 4) if budget_ratio is not None else None,
             "warnings": [],
             "cut_insights": list(self.cut_insights),
+            "employee_hours_summary": dict(employee_hours),
+            "section_coverage": coverage if coverage else list(self.section_coverage),
         }
 
     @staticmethod

@@ -11,7 +11,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-from database import Employee, EmployeeUnavailability, EmployeeSessionLocal
+from database import Employee, EmployeeUnavailability, EmployeeSessionLocal, init_database
 from roles import defined_roles
 
 
@@ -498,6 +498,7 @@ SAMPLE_EMPLOYEES: List[Dict] = [
 
 
 def seed_employees() -> None:
+    init_database()
     created = 0
     refreshed = 0
     with EmployeeSessionLocal() as session:
