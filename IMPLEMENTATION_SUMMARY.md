@@ -90,13 +90,14 @@ The maximum weekly hours limit is configured via the policy's global settings:
 ```json
 {
   "global": {
-    "max_hours_week": 40,
+    "max_hours_week": 48,
     ...
   }
 }
 ```
 
-This value is what the warning system uses for comparison.
+Note: The default baseline policy uses 48 hours per week, not 40. This can be customized in the policy settings.
+The validation function will use whatever limit is configured in the active policy.
 
 ## Key Features
 - ✅ Respects policy-configured hour limits
