@@ -9,7 +9,7 @@ from sqlalchemy.orm import selectinload
 
 from database import Employee, Shift, WeekSchedule, get_active_policy, get_week_daily_projections
 from policy import anchor_rules, build_default_policy, close_minutes, open_minutes, pre_engine_settings, required_roles
-from roles import normalize_role, role_matches
+from roles import is_manager_role, normalize_role, role_matches
 
 UTC = datetime.timezone.utc
 WEEKDAY_TOKENS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -278,7 +278,7 @@ def _demand_indices_for_week(session, week: WeekSchedule) -> Dict[int, float]:
 
 def _required_role_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
-    req_roles = required_roles(policy)
+    req_roles = [role for role in required_roles(policy) if not is_manager_role(role)]
     if not req_roles:
         return issues
     for day_index in range(7):
