@@ -216,6 +216,8 @@ def _open_close_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict
                 op_date = op_day_start.date()
             open_min = open_minutes(policy, op_date)
             close_min = close_minutes(policy, op_date)
+            if close_min < open_min:
+                close_min += 24 * 60
             open_dt = op_day_start + datetime.timedelta(minutes=open_min)
             close_dt = op_day_start + datetime.timedelta(minutes=close_min)
             if loc not in {"open", "close"} and seg_start < open_dt:
