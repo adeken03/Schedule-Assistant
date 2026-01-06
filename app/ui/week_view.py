@@ -339,7 +339,7 @@ class WeekSchedulePage(QWidget):
             context = get_or_create_week_context(session, iso_year, iso_week, f"{iso_year} W{iso_week:02d}")
             projections = get_week_daily_projections(session, context.id)
             modifiers = list_modifiers_for_week(session, self.week_start)
-        self.current_shifts = [shift for shift in shifts if not is_manager_role(shift.get("role"))]
+        self.current_shifts = list(shifts)
         self.group_breakdown = self._build_group_breakdown(shifts, projections, modifiers)
         self._sync_selected_ids()
         if selected_group:
@@ -380,7 +380,6 @@ class WeekSchedulePage(QWidget):
                 role
                 for role in roles_from_sources
                 if role
-                and not is_manager_role(role)
                 and (role.lower() not in banned_roles)
                 and ("all roles" not in role.lower())
             }

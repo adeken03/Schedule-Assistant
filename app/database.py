@@ -944,10 +944,10 @@ def list_roles(schedule_session, employee_session=None) -> List[str]:
     employee_session, close_session = _coerce_employee_session(employee_session)
     roles = set()
     for employee in employee_session.scalars(select(Employee)):
-        roles.update({role for role in employee.role_list if not is_manager_role(role)})
+        roles.update({role for role in employee.role_list})
     for role in schedule_session.execute(select(Shift.role).distinct()):
         value = role[0]
-        if value and not is_manager_role(value):
+        if value:
             roles.add(value)
     if close_session:
         employee_session.close()
@@ -1009,8 +1009,6 @@ def get_shifts_for_week(
         employees = {emp.id: emp for emp in employee_session.scalars(select(Employee))}
     payload = []
     for shift in shifts:
-        if is_manager_role(shift.role):
-            continue
         employee = employees.get(shift.employee_id) if employees else None
         payload.append(_shift_to_dict(shift, employee))
     if close_session:

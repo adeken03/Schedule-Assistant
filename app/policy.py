@@ -223,7 +223,11 @@ def close_minutes(policy: Dict, date_: datetime.date) -> int:
     label = entry.get("close") if entry else None
     parsed = parse_time_label(label)
     if parsed is not None:
-        return parsed
+        close_value = parsed
+        open_value = open_minutes(policy, date_)
+        if close_value < open_value:
+            close_value += 24 * 60
+        return close_value
     timeblocks = policy.get("timeblocks") or {}
     close_spec = timeblocks.get("close", {})
     weekday = weekday_token(date_)
@@ -236,7 +240,12 @@ def close_minutes(policy: Dict, date_: datetime.date) -> int:
         or "24:00"
     )
     parsed = parse_time_label(value)
-    return parsed if parsed is not None else 24 * 60
+    if parsed is None:
+        return 24 * 60
+    open_value = open_minutes(policy, date_)
+    if parsed < open_value:
+        return parsed + 24 * 60
+    return parsed
 
 
 def mid_minutes(policy: Dict, date_: datetime.date) -> int:
@@ -1381,7 +1390,7 @@ PRE_ENGINE_DEFAULTS: Dict[str, Any] = {
         "Cashier",
     ],
     "fallback": {
-        "allow_mgr_fallback": True,
+        "allow_mgr_fallback": False,
         "am_limit": 1,
         "pm_limit": 1,
         "tag": "MANAGER COVERING — REVIEW REQUIRED",
@@ -1510,7 +1519,7 @@ BASELINE_POLICY: Dict[str, Any] = {
     "description": "Seeded policy that balances FOH/BOH coverage for the automation workflow.",
     "section_priority": "normal",
     "hoh_mode": "auto",
-    "allow_mgr_fallback": True,
+    "allow_mgr_fallback": False,
     "global": {
         "max_hours_week": 48,
         "max_consecutive_days": 7,
