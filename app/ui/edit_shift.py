@@ -43,7 +43,7 @@ class EditShiftDialog(QDialog):
         super().__init__(parent)
         self.setModal(True)
         self.employees = employees
-        self.roles = sorted([role for role in roles if role and not is_manager_role(role)])
+        self.roles = sorted([role for role in roles if role])
         self.policy = policy or {}
         self.week_start = week_start
         self.shift = shift
@@ -165,6 +165,19 @@ class EditShiftDialog(QDialog):
         if not role:
             self.feedback_label.setText("Select a role for this shift.")
             return
+        if is_manager_role(role):
+            proceed = QMessageBox.warning(
+                self,
+                "Manager role assignment",
+                (
+                    "This is a manager-only role and should be assigned manually. "
+                    "Confirm that the manager on duty is correct before saving."
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if proceed != QMessageBox.Yes:
+                return
         qdate = self.date_edit.date()
         start_value = datetime.datetime(
             qdate.year(),

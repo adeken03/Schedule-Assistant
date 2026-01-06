@@ -30,7 +30,18 @@ from roles import defined_roles
 from wages import export_wages, import_wages
 
 EXPORT_DIR.mkdir(parents=True, exist_ok=True)
-VALID_ROLES = set(defined_roles())
+def _valid_roles() -> set[str]:
+    roles = set(defined_roles())
+    try:
+        policy = get_active_policy(None)
+    except Exception:
+        policy = None
+    if policy:
+        payload = policy.params_dict()
+        policy_roles = payload.get("roles") if isinstance(payload, dict) else {}
+        if isinstance(policy_roles, dict):
+            roles.update({name for name in policy_roles.keys() if isinstance(name, str) and name.strip()})
+    return roles
 
 
 def _timestamp() -> str:
@@ -88,13 +99,14 @@ def export_employees(employee_session) -> Path:
 def import_employees(employee_session, file_path: Path) -> Tuple[int, int]:
     data = json.loads(file_path.read_text(encoding="utf-8"))
     employees = data.get("employees", [])
+    valid_roles = _valid_roles()
     created = 0
     updated = 0
     for payload in employees:
         name = payload.get("full_name")
         if not name:
             continue
-        roles = [role for role in payload.get("roles", []) if role in VALID_ROLES]
+        roles = [role for role in payload.get("roles", []) if role and role in valid_roles]
         if not roles:
             continue
         stmt = select(Employee).where(Employee.full_name == name)
