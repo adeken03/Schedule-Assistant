@@ -202,7 +202,9 @@ class ScheduleGenerator:
             "HOH - Grill",
         }
         self.required_role_labels: Set[str] = {
-            role for role in set(required_roles(self.policy)).union(bww_required) if normalize_role(role) != "hoh - closer"
+            role
+            for role in set(required_roles(self.policy)).union(bww_required)
+            if normalize_role(role) != "hoh - closer" and not is_manager_role(role)
         }
         fallback_cfg = self.pre_engine.get("fallback", {})
         self.manager_fallback_allowed = bool(fallback_cfg.get("allow_mgr_fallback", False))

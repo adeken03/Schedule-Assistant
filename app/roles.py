@@ -86,7 +86,7 @@ def is_manager_role(role: str) -> bool:
     label = normalize_role(role)
     if not label:
         return False
-    return "mgr" in label or "MGR" in label
+    return "mgr" in label or "shift lead" in label
 
 
 def role_group(role: str) -> str:

@@ -22,7 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from policy import hourly_wage
-from roles import is_manager_role, palette_for_role, role_group
+from roles import is_manager_role, normalize_role, palette_for_role, role_group
 
 
 class EditShiftDialog(QDialog):
@@ -43,7 +43,13 @@ class EditShiftDialog(QDialog):
         super().__init__(parent)
         self.setModal(True)
         self.employees = employees
-        self.roles = sorted([role for role in roles if role and not is_manager_role(role)])
+        self.roles = sorted(
+            [
+                role
+                for role in roles
+                if role and (normalize_role(role) == "shift lead" or not is_manager_role(role))
+            ]
+        )
         self.policy = policy or {}
         self.week_start = week_start
         self.shift = shift
@@ -60,6 +66,10 @@ class EditShiftDialog(QDialog):
         layout = QVBoxLayout(self)
         self.feedback_label = QLabel()
         self.feedback_label.setStyleSheet("color:#ff7a7a;")
+        self.shift_lead_warning = QLabel("Manual assignment only; do not auto-generate.")
+        self.shift_lead_warning.setStyleSheet("color:#ffcc66;")
+        self.shift_lead_warning.setWordWrap(True)
+        self.shift_lead_warning.setVisible(False)
 
         form = QFormLayout()
 
@@ -91,6 +101,7 @@ class EditShiftDialog(QDialog):
             self.role_combo.completer().setCaseSensitivity(Qt.CaseInsensitive)
         if self.role_combo.lineEdit():
             self.role_combo.lineEdit().setPlaceholderText("Select or type a role")
+        self.role_combo.currentTextChanged.connect(self._update_role_warning)
         form.addRow("Role", self.role_combo)
 
         self.date_edit = QDateEdit()
@@ -120,6 +131,7 @@ class EditShiftDialog(QDialog):
 
         layout.addLayout(form)
         layout.addWidget(self.feedback_label)
+        layout.addWidget(self.shift_lead_warning)
 
         button_box = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
         button_box.accepted.connect(self._handle_save)
@@ -148,6 +160,7 @@ class EditShiftDialog(QDialog):
             role_index = self.role_combo.findText(role)
             if role_index >= 0:
                 self.role_combo.setCurrentIndex(role_index)
+        self._update_role_warning(self.role_combo.currentText())
         start = shift.get("start")
         end = shift.get("end")
         if isinstance(start, datetime.datetime):
@@ -222,6 +235,10 @@ class EditShiftDialog(QDialog):
         if self.on_save:
             self.on_save(payload)
         self.accept()
+
+    def _update_role_warning(self, role: str) -> None:
+        is_shift_lead = normalize_role(role) == "shift lead"
+        self.shift_lead_warning.setVisible(is_shift_lead)
 
     def _handle_delete(self) -> None:
         if not self.shift or not self.on_delete:
