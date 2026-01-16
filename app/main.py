@@ -125,6 +125,7 @@ from wages import (
 )
 from roles import ROLE_GROUPS, role_group, normalize_role
 from ui.week_view import WeekSchedulePage
+from ui.backup_dialog import BackupManagerDialog
 
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
@@ -1280,6 +1281,9 @@ class ValidationImportExportPage(QWidget):
         controls.addWidget(self.mark_exported_button)
 
         controls.addStretch()
+        self.backup_button = QPushButton("Backup/Restore")
+        self.backup_button.clicked.connect(self._open_backup_manager)
+        controls.addWidget(self.backup_button)
         layout.addLayout(controls)
         layout.addStretch(1)
         self._update_button_states()
@@ -1486,6 +1490,11 @@ class ValidationImportExportPage(QWidget):
             role=self.user.get("role"),
             details={"dataset": dataset, "path": str(path), "summary": summary},
         )
+
+    def _open_backup_manager(self) -> None:
+        dialog = BackupManagerDialog(self)
+        dialog.setStyleSheet(THEME_STYLESHEET)
+        dialog.exec()
 
     def _handle_copy_from_week(self) -> None:
         dataset = self.dataset_combo.currentData()

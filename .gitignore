@@ -9,9 +9,11 @@ __pycache__/
 *.pyo
 *.pyd
 
-# Local runtime data (databases, exports, logs, etc.)
+# Local runtime data (databases, exports, logs, backups, etc.)
 app/data/**
 !app/data/.gitkeep
+app/backups/**
+app/data_backup_*/**
 TODO.txt
 
 # OS / editor
@@ -24,4 +26,3 @@ Thumbs.db
 dist/
 build/
 *.egg-info/
-app/data/week_state.json
