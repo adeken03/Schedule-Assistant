@@ -224,6 +224,7 @@ class WeekSchedulePage(QWidget):
             list_widget.setAutoFillBackground(False)
             list_widget.setItemDelegate(ColorDelegate(list_widget))
             list_widget.setSelectionMode(QAbstractItemView.ExtendedSelection)
+            list_widget.setMinimumHeight(420)
             list_widget.itemSelectionChanged.connect(self._handle_selection_changed)
             list_widget.itemDoubleClicked.connect(lambda *_: self._open_selected_shift())
             column.addWidget(list_widget)

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import datetime
 from collections import defaultdict
@@ -7,9 +7,16 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from database import Employee, Shift, WeekSchedule, get_active_policy, get_week_daily_projections
-from policy import anchor_rules, build_default_policy, close_minutes, open_minutes, pre_engine_settings, required_roles
-from roles import normalize_role, role_matches
+from database import (
+    Employee,
+    Shift,
+    WeekSchedule,
+    get_active_policy,
+    get_week_daily_projections,
+    shift_display_date,
+)
+from policy import anchor_rules, build_default_policy, close_minutes, mid_minutes, open_minutes, pre_engine_settings, required_roles
+from roles import normalize_role, role_group, role_matches
 
 UTC = datetime.timezone.utc
 WEEKDAY_TOKENS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -20,6 +27,8 @@ ROLE_CONCURRENCY_LIMITS = {
 NORMALIZED_ROLE_LIMITS = {
     normalize_role(name): (name, limit) for name, limit in ROLE_CONCURRENCY_LIMITS.items()
 }
+ARRIVAL_WINDOW_NORMAL_MINUTES = 90
+ARRIVAL_WINDOW_MAX_MINUTES = 120
 
 
 def validate_week_schedule(session, week_start: datetime.date, *, employee_session=None) -> Dict[str, Any]:
@@ -32,6 +41,13 @@ def validate_week_schedule(session, week_start: datetime.date, *, employee_sessi
         return {
             "week_start": normalized_start.isoformat(),
             "week_id": None,
+            "checks": [
+                {
+                    "label": "Schedule exists?",
+                    "status": "fail",
+                    "details": "No schedule exists for the requested week.",
+                }
+            ],
             "issues": [
                 {
                     "type": "missing_schedule",
@@ -62,9 +78,13 @@ def validate_week_schedule(session, week_start: datetime.date, *, employee_sessi
 
     issues: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
+    issues.extend(_unassigned_shift_issues(shifts))
+    issues.extend(_empty_day_issues(shifts, normalized_start))
     issues.extend(_availability_issues(shifts, employee_map))
+    issues.extend(_role_match_issues(shifts, employee_map))
     issues.extend(_coverage_issues(shifts, policy_payload))
     issues.extend(_open_close_issues(shifts, policy_payload))
+    issues.extend(_open_close_continuity_issues(shifts))
     pre_engine_cfg = pre_engine_settings(policy_payload)
     demand_indices = _demand_indices_for_week(session, week)
     issues.extend(_required_role_issues(shifts, policy_payload))
@@ -78,9 +98,13 @@ def validate_week_schedule(session, week_start: datetime.date, *, employee_sessi
     issues.extend(hoh_errors)
     warnings.extend(hoh_warnings)
     warnings.extend(_concurrency_warnings(shifts))
+    warnings.extend(_weekly_hours_warnings(shifts, employee_map, policy_payload))
+    warnings.extend(_arrival_window_warnings(shifts, policy_payload))
+    checks = _build_validation_checklist(shifts, issues=issues)
     return {
         "week_start": normalized_start.isoformat(),
         "week_id": week.id,
+        "checks": checks,
         "issues": issues,
         "warnings": warnings,
     }
@@ -126,24 +150,228 @@ def _availability_issues(shifts: List[Shift], employees: Dict[int, Employee]) ->
     return issues
 
 
+def _unassigned_shift_issues(shifts: List[Shift]) -> List[Dict[str, Any]]:
+    issues: List[Dict[str, Any]] = []
+    for shift in shifts:
+        if shift.employee_id:
+            continue
+        op_date = shift_display_date(shift.start, shift.location)
+        start = _as_local_datetime(shift.start)
+        end = _as_local_datetime(shift.end)
+        op_day_start = datetime.datetime.combine(op_date, datetime.time.min)
+        start_minutes = int((start - op_day_start).total_seconds() // 60)
+        end_minutes = int((end - op_day_start).total_seconds() // 60)
+        day_token = WEEKDAY_TOKENS[op_date.weekday()]
+        time_label = f"{day_token} {_format_minutes(start_minutes)}"
+        if end_minutes > start_minutes:
+            time_label = f"{time_label}-{_format_minutes(end_minutes)}"
+        issues.append(
+            {
+                "type": "assignment",
+                "severity": "error",
+                "shift_id": shift.id,
+                "role": shift.role,
+                "day": WEEKDAY_TOKENS[_shift_day_index(shift)],
+                "message": f"Unassigned shift: {shift.role} at {time_label}.",
+            }
+        )
+    return issues
+
+
+def _empty_day_issues(shifts: List[Shift], week_start: datetime.date) -> List[Dict[str, Any]]:
+    issues: List[Dict[str, Any]] = []
+    counts = {idx: 0 for idx in range(7)}
+    for shift in shifts:
+        counts[_shift_day_index(shift)] += 1
+    for day_index in range(7):
+        if counts.get(day_index, 0) > 0:
+            continue
+        date_value = week_start + datetime.timedelta(days=day_index)
+        issues.append(
+            {
+                "type": "coverage",
+                "severity": "error",
+                "day": WEEKDAY_TOKENS[day_index],
+                "message": f"No shifts scheduled on {date_value.strftime('%a %Y-%m-%d')}.",
+            }
+        )
+    return issues
+
+
+def _role_match_issues(shifts: List[Shift], employees: Dict[int, Employee]) -> List[Dict[str, Any]]:
+    issues: List[Dict[str, Any]] = []
+    if not employees:
+        return issues
+    for shift in shifts:
+        if not shift.employee_id:
+            continue
+        employee = employees.get(shift.employee_id)
+        if not employee:
+            continue
+        if any(role_matches(role, shift.role) for role in employee.role_list):
+            continue
+        start = _as_local_datetime(shift.start)
+        issues.append(
+            {
+                "type": "role_match",
+                "severity": "error",
+                "shift_id": shift.id,
+                "employee_id": shift.employee_id,
+                "employee": employee.full_name,
+                "role": shift.role,
+                "day": WEEKDAY_TOKENS[_shift_day_index(shift)],
+                "message": f"{employee.full_name} is assigned {shift.role} at {start.strftime('%a %H:%M')} but is not eligible for that role.",
+            }
+        )
+    return issues
+
+
+def _open_close_continuity_issues(shifts: List[Shift]) -> List[Dict[str, Any]]:
+    """
+    Open/close continuity checks:
+    - Open buffer shifts (location=Open) must have an immediate same-group follow-up.
+    - Close buffer shifts must have an immediate same-group lead-in.
+    """
+    issues: List[Dict[str, Any]] = []
+    tolerance = datetime.timedelta(minutes=10)
+
+    def group_for(shift: Shift) -> str:
+        return role_group(shift.role or "")
+
+    open_shifts = [shift for shift in shifts if (shift.location or "").strip().lower() == "open"]
+    for opener in open_shifts:
+        day = WEEKDAY_TOKENS[_shift_day_index(opener)]
+        if opener.employee_id is None:
+            issues.append(
+                {
+                    "type": "continuity",
+                    "kind": "open_followup",
+                    "severity": "error",
+                    "shift_id": opener.id,
+                    "role": opener.role,
+                    "day": day,
+                    "message": f"Opener buffer shift is unassigned: {opener.role}.",
+                }
+            )
+            continue
+        opener_end = _as_local_datetime(opener.end)
+        opener_group = group_for(opener)
+        has_followup = any(
+            candidate is not opener
+            and candidate.employee_id == opener.employee_id
+            and group_for(candidate) == opener_group
+            and (candidate.location or "").strip().lower() != "open"
+            and abs(_as_local_datetime(candidate.start) - opener_end) <= tolerance
+            for candidate in shifts
+        )
+        if not has_followup:
+            issues.append(
+                {
+                    "type": "continuity",
+                    "kind": "open_followup",
+                    "severity": "error",
+                    "shift_id": opener.id,
+                    "role": opener.role,
+                    "employee_id": opener.employee_id,
+                    "day": day,
+                    "message": f"{opener.role} opener buffer has no same-group follow-up shift.",
+                }
+            )
+
+    def is_close_buffer(shift: Shift) -> bool:
+        if (shift.location or "").strip().lower() != "close":
+            return False
+        note = (shift.notes or "").lower()
+        if "close buffer" in note:
+            return True
+        role_norm = normalize_role(shift.role)
+        duration = shift.end - shift.start
+        if duration > datetime.timedelta(hours=2):
+            return False
+        if role_norm == "hoh - expo":
+            return True
+        return "closer" in role_norm
+
+    close_buffers = [shift for shift in shifts if is_close_buffer(shift)]
+    for buffer_shift in close_buffers:
+        day = WEEKDAY_TOKENS[_shift_day_index(buffer_shift)]
+        op_date = shift_display_date(buffer_shift.start, buffer_shift.location)
+        op_day_start = datetime.datetime.combine(op_date, datetime.time.min)
+        buffer_start_dt = _as_local_datetime(buffer_shift.start)
+        buffer_end_dt = _as_local_datetime(buffer_shift.end)
+        start_minutes = int((buffer_start_dt - op_day_start).total_seconds() // 60)
+        end_minutes = int((buffer_end_dt - op_day_start).total_seconds() // 60)
+        time_label = f"{WEEKDAY_TOKENS[op_date.weekday()]} {_format_minutes(start_minutes)}"
+        if end_minutes > start_minutes:
+            time_label = f"{time_label}-{_format_minutes(end_minutes)}"
+        if buffer_shift.employee_id is None:
+            issues.append(
+                {
+                    "type": "continuity",
+                    "kind": "close_leadin",
+                    "severity": "error",
+                    "shift_id": buffer_shift.id,
+                    "role": buffer_shift.role,
+                    "day": day,
+                    "message": f"Close buffer shift is unassigned: {buffer_shift.role} at {time_label}.",
+                }
+            )
+            continue
+        buffer_start = buffer_start_dt
+        buffer_group = group_for(buffer_shift)
+        has_leadin = any(
+            candidate is not buffer_shift
+            and candidate.employee_id == buffer_shift.employee_id
+            and group_for(candidate) == buffer_group
+            and abs(_as_local_datetime(candidate.end) - buffer_start) <= tolerance
+            for candidate in shifts
+        )
+        if not has_leadin:
+            issues.append(
+                {
+                    "type": "continuity",
+                    "kind": "close_leadin",
+                    "severity": "error",
+                    "shift_id": buffer_shift.id,
+                    "role": buffer_shift.role,
+                    "employee_id": buffer_shift.employee_id,
+                    "day": day,
+                    "message": f"{buffer_shift.role} close buffer has no same-group lead-in shift.",
+                }
+            )
+
+    return issues
+
+
 def _coverage_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
     anchors = anchor_rules(policy)
     opener_requirements = anchors.get("openers", {})
     closer_requirements = anchors.get("closers", {})
-    opener_roles = anchors.get("opener_roles", {})
-    closer_roles = anchors.get("closer_roles", {})
     opener_counts: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     closer_counts: Dict[int, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+
+    def _is_close_buffer(shift: Shift) -> bool:
+        if (shift.location or "").strip().lower() != "close":
+            return False
+        note = (shift.notes or "").lower()
+        if "close buffer" in note:
+            return True
+        role_norm = normalize_role(shift.role)
+        duration = shift.end - shift.start
+        if duration > datetime.timedelta(hours=2):
+            return False
+        if role_norm == "hoh - expo":
+            return True
+        return "closer" in role_norm
+
     for shift in shifts:
-        start = shift.start.astimezone(UTC)
-        day_index = start.weekday()
-        for group, roles in opener_roles.items():
-            if _matches_role(shift.role, roles):
-                opener_counts[day_index][group] += 1
-        for group, roles in closer_roles.items():
-            if _matches_role(shift.role, roles):
-                closer_counts[day_index][group] += 1
+        day_index = _shift_day_index(shift)
+        group = role_group(shift.role or "")
+        if (shift.location or "").strip().lower() == "open":
+            opener_counts[day_index][group] += 1
+        if _is_close_buffer(shift):
+            closer_counts[day_index][group] += 1
     issues.extend(
         _compare_anchor_counts(
             opener_counts,
@@ -159,6 +387,191 @@ def _coverage_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict[s
         )
     )
     return issues
+
+
+def _build_validation_checklist(
+    shifts: List[Shift],
+    *,
+    issues: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """
+    Produce a concise, UI-friendly checklist:
+    - `status`: ok|fail
+    - `label`: human readable prompt
+    - `details`: optional context for failures
+    """
+    checks: List[Dict[str, Any]] = []
+
+    def summarize(items: List[Dict[str, Any]], *, limit: int = 5) -> str:
+        parts: List[str] = []
+        for entry in items[:limit]:
+            message = str(entry.get("message") or "").strip()
+            if message:
+                parts.append(message)
+                continue
+            day = entry.get("day")
+            group = entry.get("group") or entry.get("role")
+            if day and group:
+                parts.append(f"{day} {group}")
+        if len(items) > limit:
+            parts.append(f"+{len(items) - limit} more")
+        return "; ".join(parts)
+
+    def add_check(label: str, ok: bool, *, details: str = "") -> None:
+        checks.append(
+            {
+                "label": label,
+                "status": "ok" if ok else "fail",
+                "details": details if not ok else "",
+            }
+        )
+
+    def issues_of(type_name: str, *, kind: Optional[str] = None, anchor: Optional[str] = None) -> List[Dict[str, Any]]:
+        matches: List[Dict[str, Any]] = []
+        for issue in issues:
+            if issue.get("type") != type_name:
+                continue
+            if kind and issue.get("kind") != kind:
+                continue
+            if anchor and issue.get("anchor") != anchor:
+                continue
+            matches.append(issue)
+        return matches
+
+    total_shifts = len(shifts)
+    add_check("Shifts scheduled?", total_shifts > 0, details="No shifts found.")
+
+    day_counts = {idx: 0 for idx in range(7)}
+    for shift in shifts:
+        day_counts[_shift_day_index(shift)] += 1
+    empty_days = [WEEKDAY_TOKENS[idx] for idx in range(7) if day_counts.get(idx, 0) == 0]
+    add_check(
+        "Coverage every day?",
+        not empty_days,
+        details=f"Missing: {', '.join(empty_days)}",
+    )
+
+    unassigned = issues_of("assignment")
+    add_check(
+        "All shifts assigned?",
+        not unassigned,
+        details=summarize(unassigned),
+    )
+
+    hours_issues = issues_of("hours")
+    add_check(
+        "Time boundaries respected?",
+        not hours_issues,
+        details=summarize(hours_issues),
+    )
+
+    openers_missing = issues_of("coverage", anchor="openers")
+    add_check(
+        "Openers present?",
+        not openers_missing,
+        details=summarize(openers_missing),
+    )
+
+    closers_missing = issues_of("coverage", anchor="closers")
+    add_check(
+        "Closers present?",
+        not closers_missing,
+        details=summarize(closers_missing),
+    )
+
+    opener_continuity = issues_of("continuity", kind="open_followup")
+    add_check(
+        "Opener \u2192 AM continuity?",
+        not opener_continuity,
+        details=summarize(opener_continuity),
+    )
+
+    closer_continuity = issues_of("continuity", kind="close_leadin")
+    add_check(
+        "PM \u2192 closer continuity?",
+        not closer_continuity,
+        details=summarize(closer_continuity),
+    )
+
+    role_mismatch = issues_of("role_match")
+    add_check(
+        "Role matching correct?",
+        not role_mismatch,
+        details=summarize(role_mismatch),
+    )
+
+    availability = issues_of("availability")
+    add_check(
+        "Availability respected?",
+        not availability,
+        details=summarize(availability),
+    )
+
+    required_missing = issues_of("required_role")
+    add_check(
+        "Required roles fulfilled?",
+        not required_missing,
+        details=summarize(required_missing),
+    )
+
+    staffing = issues_of("staffing")
+    add_check(
+        "Staffing thresholds met?",
+        not staffing,
+        details=summarize(staffing),
+    )
+
+    hoh_combo = issues_of("hoh_combo")
+    add_check(
+        "Kitchen station logic ok?",
+        not hoh_combo,
+        details=summarize(hoh_combo),
+    )
+
+    fallback = issues_of("fallback")
+    add_check(
+        "Manager fallback ok?",
+        not fallback,
+        details=summarize(fallback),
+    )
+
+    return checks
+
+
+def _weekly_hours_warnings(
+    shifts: List[Shift], employees: Dict[int, Employee], policy: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """Check if any employee exceeds the maximum weekly hours limit."""
+    warnings: List[Dict[str, Any]] = []
+    global_cfg = policy.get("global") or {}
+    max_hours_per_week = float(global_cfg.get("max_hours_week", 40) or 40)
+    
+    # Calculate total hours per employee
+    employee_hours: Dict[int, float] = defaultdict(float)
+    for shift in shifts:
+        if not shift.employee_id:
+            continue
+        hours = (shift.end - shift.start).total_seconds() / 3600
+        employee_hours[shift.employee_id] += hours
+    
+    # Check each employee against the limit
+    for employee_id, total_hours in employee_hours.items():
+        if total_hours > max_hours_per_week + 1e-6:  # Small tolerance for floating point
+            employee = employees.get(employee_id)
+            employee_name = employee.full_name if employee else f"Employee {employee_id}"
+            warnings.append(
+                {
+                    "type": "weekly_hours",
+                    "severity": "warning",
+                    "employee_id": employee_id,
+                    "employee": employee_name,
+                    "hours": round(total_hours, 2),
+                    "limit": max_hours_per_week,
+                    "message": f"{employee_name} is scheduled {round(total_hours, 2)} hours "
+                    f"(exceeds {max_hours_per_week}-hour limit by {round(total_hours - max_hours_per_week, 2)} hours).",
+                }
+            )
+    return warnings
 
 
 def _concurrency_warnings(shifts: List[Shift]) -> List[Dict[str, Any]]:
@@ -254,6 +667,93 @@ def _open_close_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict
     return issues
 
 
+def _arrival_window_warnings(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Warn when a manual shift starts outside the observed AM/PM arrival windows.
+
+    - Normal latest arrivals: 1.5 hours after period start
+    - Hard latest arrivals: 2 hours after period start
+
+    This is informational only; it does not block saves/publishing.
+    """
+    warnings: List[Dict[str, Any]] = []
+    normal_delta = datetime.timedelta(minutes=ARRIVAL_WINDOW_NORMAL_MINUTES)
+    hard_delta = datetime.timedelta(minutes=ARRIVAL_WINDOW_MAX_MINUTES)
+
+    for shift in shifts:
+        role_norm = normalize_role(shift.role)
+        if not role_norm:
+            continue
+        if "bartender" in role_norm:
+            continue
+        if "close buffer" in (shift.notes or "").lower():
+            continue
+        loc = (shift.location or "").strip().lower()
+        if loc == "open":
+            continue
+
+        start = _as_local_datetime(shift.start)
+        op_day_start = datetime.datetime.combine(start.date(), datetime.time.min)
+        op_date = op_day_start.date()
+        # Close segments that start after midnight belong to the previous operational day.
+        if loc == "close" and start.time() < datetime.time(6, 0):
+            op_day_start = op_day_start - datetime.timedelta(days=1)
+            op_date = op_day_start.date()
+
+        open_dt = op_day_start + datetime.timedelta(minutes=open_minutes(policy, op_date))
+        mid_dt = op_day_start + datetime.timedelta(minutes=mid_minutes(policy, op_date))
+        if mid_dt <= open_dt:
+            mid_dt = open_dt + datetime.timedelta(hours=5)
+        close_dt = op_day_start + datetime.timedelta(minutes=close_minutes(policy, op_date))
+        if close_dt <= open_dt:
+            close_dt = close_dt + datetime.timedelta(days=1)
+
+        period = None
+        period_start = None
+        if open_dt <= start < mid_dt:
+            period = "AM"
+            period_start = open_dt
+        elif mid_dt <= start < close_dt:
+            period = "PM"
+            period_start = mid_dt
+        else:
+            continue
+
+        normal_latest = period_start + normal_delta
+        hard_latest = period_start + hard_delta
+        if start <= normal_latest:
+            continue
+
+        day_label = WEEKDAY_TOKENS[op_date.weekday()]
+        level = "normal"
+        if start > hard_latest:
+            level = "max"
+            message = (
+                f"{shift.role} starts at {start.strftime('%H:%M')} on {day_label}, which is after the "
+                f"2h arrival cap ({hard_latest.strftime('%H:%M')}) for {period}."
+            )
+        else:
+            message = (
+                f"{shift.role} starts at {start.strftime('%H:%M')} on {day_label}, which is after the "
+                f"normal 1.5h arrival window ({normal_latest.strftime('%H:%M')}) for {period}."
+            )
+
+        warnings.append(
+            {
+                "type": "arrival_window",
+                "severity": "warning",
+                "shift_id": shift.id,
+                "role": shift.role,
+                "day": day_label,
+                "period": period,
+                "level": level,
+                "message": message,
+            }
+        )
+
+    return warnings
+
+
 def _demand_indices_for_week(session, week: WeekSchedule) -> Dict[int, float]:
     indices: Dict[int, float] = {}
     try:
@@ -278,16 +778,58 @@ def _demand_indices_for_week(session, week: WeekSchedule) -> Dict[int, float]:
 
 def _required_role_issues(shifts: List[Shift], policy: Dict[str, Any]) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
-    req_roles = required_roles(policy)
+    # Mirror the generator's "must exist" role labels for baseline validation.
+    bww_required = {
+        "Bartender - Opener",
+        "Bartender - Closer",
+        "Server - Opener",
+        "Server - Dining Preclose",
+        "Server - Dining Closer",
+        "Server - Cocktail Preclose",
+        "Server - Cocktail Closer",
+        "HOH - Opener",
+        "HOH - Expo",
+        "HOH - Southwest",
+        "HOH - Chip",
+        "HOH - Shake",
+        "HOH - Grill",
+        "Cashier",
+    }
+    req_roles = {role for role in set(required_roles(policy)).union(bww_required) if normalize_role(role) != "hoh - closer"}
     if not req_roles:
         return issues
+
+    def role_present(day_index: int, required_role: str) -> bool:
+        required_norm = normalize_role(required_role)
+        for shift in shifts:
+            if _shift_day_index(shift) != day_index:
+                continue
+            role_norm = normalize_role(shift.role)
+            if required_norm.startswith("hoh - "):
+                if required_norm.endswith("southwest") and ("southwest" in role_norm or "sw/" in role_norm):
+                    return True
+                if required_norm.endswith("grill") and "grill" in role_norm:
+                    return True
+                if required_norm.endswith("chip") and "chip" in role_norm:
+                    return True
+                if required_norm.endswith("shake") and "shake" in role_norm:
+                    return True
+                if required_norm.endswith("expo") and required_norm == role_norm:
+                    return True
+                if required_norm.endswith("opener") and required_norm == role_norm:
+                    return True
+                continue
+            if required_norm == role_norm:
+                return True
+        return False
+
     for day_index in range(7):
         for role in req_roles:
-            if any(role_matches(shift.role, role) and _shift_day_index(shift) == day_index for shift in shifts):
+            if role_present(day_index, role):
                 continue
             issues.append(
                 {
-                    "type": "coverage",
+                    "type": "required_role",
                     "severity": "error",
                     "day": WEEKDAY_TOKENS[day_index],
                     "role": role,
@@ -301,7 +843,7 @@ def _fallback_issues(shifts: List[Shift], pre_engine_cfg: Dict[str, Any]) -> Tup
     errors: List[Dict[str, Any]] = []
     warnings: List[Dict[str, Any]] = []
     fallback_cfg = pre_engine_cfg.get("fallback", {})
-    tag = str(fallback_cfg.get("tag", "MANAGER COVERING — REVIEW REQUIRED")).lower()
+    tag = str(fallback_cfg.get("tag", "MANAGER COVERING ΓÇö REVIEW REQUIRED")).lower()
     am_limit = int(fallback_cfg.get("am_limit", 1) or 0)
     pm_limit = int(fallback_cfg.get("pm_limit", 1) or 0)
     disallow_terms = [str(entry).lower() for entry in fallback_cfg.get("disallow_roles", [])]
@@ -511,6 +1053,7 @@ def _compare_anchor_counts(
                 issues.append(
                     {
                         "type": "coverage",
+                        "anchor": label,
                         "severity": "error",
                         "day": WEEKDAY_TOKENS[day_index],
                         "group": group,
@@ -540,11 +1083,8 @@ def _shift_segments(shift: Shift) -> List[Tuple[int, datetime.datetime, datetime
 
 
 def _shift_day_index(shift: Shift) -> int:
-    segments = _shift_segments(shift)
-    if segments:
-        return segments[0][0]
     try:
-        return shift.start.weekday()
+        return shift_display_date(shift.start, shift.location).weekday()
     except Exception:  # noqa: BLE001
         return 0
 

@@ -18,7 +18,7 @@ if str(APP_DIR) not in sys.path:
 from sqlalchemy import select
 
 from PySide6.QtCore import Qt, QDate, QTime, QEvent, QTimer
-from PySide6.QtGui import QCloseEvent, QIcon, QIntValidator, QFont
+from PySide6.QtGui import QCloseEvent, QColor, QIcon, QIntValidator, QFont
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QAbstractItemView,
@@ -124,6 +124,7 @@ from wages import (
     ALLOW_ZERO_ROLES,
 )
 from roles import ROLE_GROUPS, role_group, normalize_role
+from validation import validate_week_schedule
 from ui.week_view import WeekSchedulePage
 from ui.backup_dialog import BackupManagerDialog
 
@@ -1181,6 +1182,8 @@ class ValidationImportExportPage(QWidget):
         self.on_status_updated = on_status_updated
         self.on_week_data_changed = on_week_data_changed
         self.summary_data: Dict[str, Any] = {}
+        self.last_validation_report: Optional[Dict[str, Any]] = None
+        self.last_validation_week_id: Optional[int] = None
         self.week_selector: Optional[WeekSelectorWidget] = None
         self._build_ui()
         self.set_active_week(active_week)
@@ -1343,25 +1346,107 @@ class ValidationImportExportPage(QWidget):
 
     def _refresh_validation_notes(self) -> None:
         self.validation_list.clear()
+        self.results_list.clear()
+        if not self._current_week_start():
+            return
+        report = self._collect_validation_report()
+        if report:
+            self._render_validation_report(report)
+        else:
+            self.validation_list.addItem("Run validation to see checklist results.")
+
+    def _active_policy_roles(self, policy: Dict[str, Any]) -> List[str]:
+        roles: List[str] = []
+        roles_cfg = policy.get("roles", {}) if isinstance(policy, dict) else {}
+        if isinstance(roles_cfg, dict):
+            for role, cfg in roles_cfg.items():
+                if isinstance(cfg, dict) and cfg.get("enabled", True) is False:
+                    continue
+                roles.append(role)
+        if not roles and isinstance(policy, dict):
+            roles = list(role_catalog(policy))
+        return sorted({role for role in roles if role})
+
+    def _collect_validation_report(self) -> Optional[Dict[str, Any]]:
         week_start = self._current_week_start()
         if not week_start:
-            return
+            return None
         with self.session_factory() as session:
-            summary = get_week_summary(session, week_start)
-            shifts = get_shifts_for_week(session, week_start)
-            policy = load_active_policy_spec(self.session_factory)
-        empty_days = [day["date"] for day in summary.get("days", []) if day.get("count", 0) == 0]
-        if empty_days:
-            self.validation_list.addItem(f"No coverage scheduled for: {', '.join(empty_days)}")
-        unassigned = [s for s in shifts if not s.get("employee_id")]
-        if unassigned:
-            self.validation_list.addItem(f"{len(unassigned)} unassigned shift(s) remain.")
-        missing_wages = validate_wages(role_catalog(policy))
-        if missing_wages:
-            roles_list = ", ".join(sorted(missing_wages.keys()))
-            self.validation_list.addItem(f"Wages missing/unchecked for: {roles_list}")
-        if summary.get("total_cost", 0) <= 0:
-            self.validation_list.addItem("No labor cost recorded yet. Validate after generating schedule.")
+            with self.employee_session_factory() as employee_session:
+                report = validate_week_schedule(session, week_start, employee_session=employee_session)
+        policy = load_active_policy_spec(self.session_factory)
+        roles = self._active_policy_roles(policy)
+        warnings = list(report.get("warnings") or [])
+        issues = list(report.get("issues") or [])
+        if roles:
+            missing_wages = validate_wages(roles)
+            if missing_wages:
+                roles_list = ", ".join(sorted(missing_wages.keys()))
+                warnings.append(
+                    {
+                        "type": "wages",
+                        "severity": "warning",
+                        "message": f"Wages missing/unchecked for: {roles_list}",
+                    }
+                )
+        report = dict(report)
+        report["warnings"] = warnings
+        report["issues"] = issues
+        self.last_validation_report = report
+        self.last_validation_week_id = report.get("week_id")
+        return report
+
+    def _format_finding(self, entry: Dict[str, Any]) -> str:
+        label = str(entry.get("message") or "").strip()
+        if label:
+            return label
+        kind = entry.get("type") or "issue"
+        day = entry.get("day")
+        role = entry.get("role")
+        if day and role:
+            return f"{kind}: {role} ({day})"
+        return str(entry)
+
+    def _render_validation_report(self, report: Dict[str, Any]) -> None:
+        self.validation_list.clear()
+        self.results_list.clear()
+        checks = list(report.get("checks") or [])
+        if checks:
+            for entry in checks:
+                status = str(entry.get("status") or "fail").strip().lower()
+                label = str(entry.get("label") or "Check").strip()
+                details = str(entry.get("details") or "").strip()
+                prefix = "PASS" if status == "ok" else "FAIL"
+                text = f"{prefix}: {label}"
+                if status != "ok" and details:
+                    text = f"{text} — {details}"
+                item = QListWidgetItem(text)
+                item.setForeground(QColor(SUCCESS_COLOR if status == "ok" else ERROR_COLOR))
+                if details:
+                    item.setToolTip(details)
+                self.validation_list.addItem(item)
+        else:
+            self.validation_list.addItem("Checklist not available for this week.")
+
+        issues = list(report.get("issues") or [])
+        warnings = list(report.get("warnings") or [])
+        if not issues and not warnings:
+            self.results_list.addItem("No issues or warnings found.")
+            return
+        for entry in issues:
+            item = QListWidgetItem(f"FAIL [{entry.get('type', 'issue')}] {self._format_finding(entry)}")
+            item.setForeground(QColor(ERROR_COLOR))
+            self.results_list.addItem(item)
+        for entry in warnings:
+            item = QListWidgetItem(f"WARN [{entry.get('type', 'warning')}] {self._format_finding(entry)}")
+            item.setForeground(QColor(WARNING_COLOR))
+            self.results_list.addItem(item)
+
+    def _current_validation_report(self) -> Optional[Dict[str, Any]]:
+        week_id = self.summary_data.get("week_id")
+        if self.last_validation_report and self.last_validation_week_id == week_id:
+            return self.last_validation_report
+        return self._collect_validation_report()
 
     def _handle_week_change(self, iso_year: int, iso_week: int, label: str) -> None:
         self.active_week = {"iso_year": iso_year, "iso_week": iso_week, "label": label}
@@ -1376,29 +1461,22 @@ class ValidationImportExportPage(QWidget):
         if not week_start:
             self._set_feedback("Select a week to validate.", WARNING_COLOR)
             return
-        with self.session_factory() as session:
-            summary = get_week_summary(session, week_start)
-            shifts = get_shifts_for_week(session, week_start)
-        errors: List[str] = []
-        if summary.get("total_shifts", 0) == 0:
-            errors.append("No shifts scheduled for the selected week.")
-        for day in summary.get("days", []):
-            if day.get("count", 0) == 0:
-                errors.append(f"No coverage scheduled for {day.get('date')}.")
-        for shift in shifts:
-            if not shift.get("employee_id"):
-                start = shift.get("start")
-                label = self._format_shift_label(start)
-                errors.append(f"{shift.get('role')} shift starting {label} is unassigned.")
-        if errors:
-            for message in errors:
-                self.results_list.addItem(f"Error: {message}")
-            self._set_feedback("Validation failed. Resolve the errors highlighted above.", ERROR_COLOR)
-            self._refresh_summary()
+        report = self._collect_validation_report()
+        if not report:
+            self._set_feedback("Validation failed to run.", ERROR_COLOR)
             return
-        self.results_list.addItem("Validation complete. Week is ready for export.")
-        self._set_feedback("All checks passed. Week marked as validated.", SUCCESS_COLOR)
+        self._render_validation_report(report)
+        issues = report.get("issues") or []
+        warnings = report.get("warnings") or []
+        if issues:
+            self._set_feedback(f"Validation failed ({len(issues)} issue(s)).", ERROR_COLOR)
+            self._apply_week_status("draft")
+            return
         self._apply_week_status("validated")
+        if warnings:
+            self._set_feedback(f"Week validated with {len(warnings)} warning(s).", WARNING_COLOR)
+        else:
+            self._set_feedback("All checks passed. Week marked as validated.", SUCCESS_COLOR)
         audit_logger.log(
             "week_validated",
             self.user.get("username", "unknown"),
@@ -1418,6 +1496,24 @@ class ValidationImportExportPage(QWidget):
         if not week_id:
             self._set_feedback("No schedule data found for the selected week.", ERROR_COLOR)
             return
+        report = self._current_validation_report()
+        if report:
+            issues = report.get("issues") or []
+            warnings = report.get("warnings") or []
+            if issues:
+                self._set_feedback("Validation errors found. Resolve them before exporting.", ERROR_COLOR)
+                self._apply_week_status("draft")
+                return
+            if warnings:
+                warning_lines = "\n".join(f"- {self._format_finding(entry)}" for entry in warnings[:8])
+                confirm = QMessageBox.question(
+                    self,
+                    "Export with warnings",
+                    "Warnings were found during validation:\n\n"
+                    f"{warning_lines}\n\nExport anyway?",
+                )
+                if confirm != QMessageBox.Yes:
+                    return
         fmt = self.export_format.currentData() or "pdf"
         export_path = export_week(week_id, fmt)
         self._finalize_export(manual=False)
@@ -1662,6 +1758,7 @@ class ValidationImportExportPage(QWidget):
 
     def _notify_week_mutation(self) -> None:
         self._refresh_summary()
+        self._refresh_validation_notes()
         if self.on_status_updated:
             self.on_status_updated("draft")
         if self.on_week_data_changed:
