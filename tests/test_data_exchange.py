@@ -22,6 +22,7 @@ from database import (  # noqa: E402
     EmployeeUnavailability,
     ProjectionsBase,
     Policy,
+    SavedModifier,
     Shift,
     WeekContext,
     WeekDailyProjection,
@@ -195,19 +196,36 @@ def test_modifier_export_import_round_trip(memory_db) -> None:
         created_by="tester",
     )
     session.add(modifier)
+    session.add(
+        SavedModifier(
+            title="Template",
+            modifier_type="increase",
+            day_of_week=3,
+            start_time=datetime.time(10, 0),
+            end_time=datetime.time(12, 0),
+            pct_change=5,
+            notes="Template note",
+            created_by="tester",
+        )
+    )
     session.commit()
 
     export_path = export_week_modifiers(session, week)
     session.execute(delete(db.Modifier))
+    session.execute(delete(SavedModifier))
     session.commit()
 
     added = import_week_modifiers(session, week, export_path, created_by="tester")
     stored = session.scalars(select(db.Modifier)).all()
+    saved = session.scalars(select(SavedModifier)).all()
 
     assert added == 1
     assert len(stored) == 1
+    assert len(saved) == 1
     assert stored[0].title == "Event"
     assert stored[0].notes == "Big game"
+    assert saved[0].title == "Template"
+    assert saved[0].notes == "Template note"
 
 
 def test_shift_export_import_with_employee_names(memory_db) -> None:

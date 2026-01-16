@@ -129,7 +129,7 @@ from ui.week_view import WeekSchedulePage
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
-ICON_FILE = Path(__file__).resolve().parents[1] / "project_image.ico"
+ICON_FILE = Path(__file__).resolve().parents[1] / "BWW_Scheduler.ico"
 ACCOUNTS_FILE = DATA_DIR / "accounts.json"
 AUDIT_FILE = DATA_DIR / "audit.log"
 WEEK_STATE_FILE = DATA_DIR / "week_state.json"
@@ -1169,6 +1169,7 @@ class ValidationImportExportPage(QWidget):
         *,
         on_week_changed: Optional[Callable[[int, int, str], None]] = None,
         on_status_updated: Optional[Callable[[str], None]] = None,
+        on_week_data_changed: Optional[Callable[[], None]] = None,
     ) -> None:
         super().__init__()
         self.session_factory = session_factory
@@ -1177,6 +1178,7 @@ class ValidationImportExportPage(QWidget):
         self.active_week = active_week
         self.on_week_changed = on_week_changed
         self.on_status_updated = on_status_updated
+        self.on_week_data_changed = on_week_data_changed
         self.summary_data: Dict[str, Any] = {}
         self.week_selector: Optional[WeekSelectorWidget] = None
         self._build_ui()
@@ -1233,6 +1235,13 @@ class ValidationImportExportPage(QWidget):
         dataset_form = QFormLayout()
         dataset_form.addRow("Dataset", self.dataset_combo)
         exchange_layout.addLayout(dataset_form)
+
+        self.employee_import_mode_label = QLabel("Employee import mode")
+        self.employee_import_mode = QComboBox()
+        self.employee_import_mode.addItem("Replace (default)", "replace")
+        self.employee_import_mode.addItem("Merge / append", "merge")
+        self.employee_import_mode.setCurrentIndex(0)
+        dataset_form.addRow(self.employee_import_mode_label, self.employee_import_mode)
 
         dataset_buttons = QHBoxLayout()
         dataset_buttons.setSpacing(10)
@@ -1322,6 +1331,11 @@ class ValidationImportExportPage(QWidget):
             self.import_dataset_button.setEnabled(bool(dataset) and allow_dataset)
         if hasattr(self, "copy_week_button"):
             self.copy_week_button.setEnabled(bool(dataset) and dataset != "employees" and has_week)
+        if hasattr(self, "employee_import_mode"):
+            is_employee = dataset == "employees"
+            self.employee_import_mode_label.setVisible(bool(is_employee))
+            self.employee_import_mode.setVisible(bool(is_employee))
+            self.employee_import_mode.setEnabled(bool(is_employee))
 
     def _refresh_validation_notes(self) -> None:
         self.validation_list.clear()
@@ -1599,7 +1613,11 @@ class ValidationImportExportPage(QWidget):
             return {"roles": count}
         if dataset == "employees":
             with self.employee_session_factory() as employee_session:
-                created, updated = import_employees(employee_session, path)
+                mode = "replace"
+                if hasattr(self, "employee_import_mode"):
+                    mode = self.employee_import_mode.currentData() or "replace"
+                replace_existing = mode != "merge"
+                created, updated = import_employees(employee_session, path, replace_existing=replace_existing)
                 return {"created": created, "updated": updated}
         with self.session_factory() as session:
             week = self._get_week_context(session)
@@ -1637,6 +1655,8 @@ class ValidationImportExportPage(QWidget):
         self._refresh_summary()
         if self.on_status_updated:
             self.on_status_updated("draft")
+        if self.on_week_data_changed:
+            self.on_week_data_changed()
 
 
 class ModifierDialog(QDialog):
@@ -4725,13 +4745,30 @@ class EmployeeEditDialog(QDialog):
         custom_row.addWidget(self.add_custom_role_button)
         roles_layout.addLayout(custom_row)
 
+        preference_hint = QLabel("Preference order: top = most desired, bottom = fallback. Drag to reorder.")
+        preference_hint.setWordWrap(True)
+        roles_layout.addWidget(preference_hint)
+
         self.role_list_widget = QListWidget()
         self.role_list_widget.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.role_list_widget.setDragDropMode(QAbstractItemView.InternalMove)
+        self.role_list_widget.setDefaultDropAction(Qt.MoveAction)
+        self.role_list_widget.setDragEnabled(True)
+        self.role_list_widget.setAcceptDrops(True)
+        self.role_list_widget.setDropIndicatorShown(True)
         self.role_list_widget.itemSelectionChanged.connect(self._update_role_buttons)
         self.role_list_widget.itemDoubleClicked.connect(lambda *_: self.remove_selected_role())
         roles_layout.addWidget(self.role_list_widget)
 
         list_button_row = QHBoxLayout()
+        self.move_up_button = QPushButton("Move up")
+        self.move_up_button.clicked.connect(lambda: self._move_role(-1))
+        list_button_row.addWidget(self.move_up_button)
+
+        self.move_down_button = QPushButton("Move down")
+        self.move_down_button.clicked.connect(lambda: self._move_role(1))
+        list_button_row.addWidget(self.move_down_button)
+
         self.remove_role_button = QPushButton("Remove selected")
         self.remove_role_button.clicked.connect(self.remove_selected_role)
         list_button_row.addWidget(self.remove_role_button)
@@ -4867,8 +4904,25 @@ class EmployeeEditDialog(QDialog):
         return True
 
     def _update_role_buttons(self) -> None:
-        has_selection = self.role_list_widget.currentItem() is not None
+        current_item = self.role_list_widget.currentItem()
+        has_selection = current_item is not None
+        row = self.role_list_widget.row(current_item) if current_item else -1
+        count = self.role_list_widget.count()
         self.remove_role_button.setEnabled(has_selection)
+        self.move_up_button.setEnabled(has_selection and row > 0)
+        self.move_down_button.setEnabled(has_selection and 0 <= row < count - 1)
+
+    def _move_role(self, delta: int) -> None:
+        current_item = self.role_list_widget.currentItem()
+        if not current_item:
+            return
+        row = self.role_list_widget.row(current_item)
+        target = row + delta
+        if target < 0 or target >= self.role_list_widget.count():
+            return
+        item = self.role_list_widget.takeItem(row)
+        self.role_list_widget.insertItem(target, item)
+        self.role_list_widget.setCurrentItem(item)
 
     def _edit_role_wages(self) -> None:
         roles = self._collect_roles()
@@ -5390,14 +5444,14 @@ class EmployeeDirectoryDialog(QDialog):
         self.table.setHorizontalHeaderLabels(
             ["Name", "Roles", "Desired hours", "Start date", "Status", "Notes"]
         )
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.itemSelectionChanged.connect(self.update_button_state)
         self.table.cellDoubleClicked.connect(lambda *_: self.edit_employee())
@@ -5456,26 +5510,35 @@ class EmployeeDirectoryDialog(QDialog):
         self.table.resizeRowsToContents()
         self.update_button_state()
     def selected_employee(self) -> Optional[Employee]:
+        employees = self.selected_employees()
+        return employees[0] if employees else None
+
+    def selected_employees(self) -> List[Employee]:
         selection = self.table.selectionModel()
         if not selection or not selection.hasSelection():
-            return None
+            return []
         selected_rows = selection.selectedRows()
         if not selected_rows:
-            return None
-        row = selected_rows[0].row()
-        if 0 <= row < len(self.visible_employees):
-            return self.visible_employees[row]
-        return None
+            return []
+        employees: List[Employee] = []
+        for item in sorted(selected_rows, key=lambda entry: entry.row()):
+            row = item.row()
+            if 0 <= row < len(self.visible_employees):
+                employees.append(self.visible_employees[row])
+        return employees
 
     def update_button_state(self) -> None:
-        employee = self.selected_employee()
-        has_selection = employee is not None
-        self.edit_button.setEnabled(has_selection)
-        self.toggle_button.setEnabled(has_selection)
-        self.availability_button.setEnabled(has_selection)
-        self.wage_override_button.setEnabled(has_selection)
-        if employee:
+        employees = self.selected_employees()
+        selection_count = len(employees)
+        self.edit_button.setEnabled(selection_count == 1)
+        self.toggle_button.setEnabled(selection_count >= 1)
+        self.availability_button.setEnabled(selection_count == 1)
+        self.wage_override_button.setEnabled(selection_count == 1)
+        if selection_count == 1:
+            employee = employees[0]
             self.toggle_button.setText("Deactivate" if employee.status == "active" else "Activate")
+        elif selection_count > 1:
+            self.toggle_button.setText("Deactivate/Delete")
         else:
             self.toggle_button.setText("Deactivate")
 
@@ -5522,15 +5585,39 @@ class EmployeeDirectoryDialog(QDialog):
             self.refresh_table()
 
     def toggle_employee_status(self) -> None:
-        employee = self.selected_employee()
-        if not employee:
+        employees = self.selected_employees()
+        if not employees:
             return
+        if len(employees) > 1:
+            action = self._prompt_bulk_employee_action(len(employees))
+            if action == "delete":
+                self._delete_employees(employees)
+            elif action == "deactivate":
+                self._bulk_update_employee_status(employees, "inactive")
+            return
+        employee = employees[0]
         action = self._prompt_employee_action(employee)
         if action == "delete":
             self._delete_employee(employee)
         elif action == "toggle":
             new_status = "inactive" if employee.status == "active" else "active"
             self._update_employee_status(employee, new_status)
+
+    def _prompt_bulk_employee_action(self, count: int) -> str:
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("Update employees")
+        dialog.setText(f"What would you like to do with {count} employees?")
+        deactivate_button = dialog.addButton("Deactivate", QMessageBox.ActionRole)
+        delete_button = dialog.addButton("Delete", QMessageBox.ActionRole)
+        dialog.addButton(QMessageBox.Cancel)
+        dialog.setDefaultButton(deactivate_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked == delete_button:
+            return "delete"
+        if clicked == deactivate_button:
+            return "deactivate"
+        return "cancel"
 
     def _prompt_employee_action(self, employee: Employee) -> str:
         dialog = QMessageBox(self)
@@ -5564,6 +5651,24 @@ class EmployeeDirectoryDialog(QDialog):
         )
         self.refresh_table()
 
+    def _delete_employees(self, employees: List[Employee]) -> None:
+        ids = [employee.id for employee in employees if employee.id is not None]
+        if not ids:
+            return
+        with self.session_factory() as session:
+            for emp_id in ids:
+                db_employee = session.get(Employee, emp_id)
+                if db_employee:
+                    session.delete(db_employee)
+            session.commit()
+        audit_logger.log(
+            "employee_bulk_delete",
+            self.actor["username"],
+            role=self.actor.get("role"),
+            details={"employee_ids": ids, "count": len(ids)},
+        )
+        self.refresh_table()
+
     def _update_employee_status(self, employee: Employee, new_status: str) -> None:
         with self.session_factory() as session:
             db_employee = session.get(Employee, employee.id)
@@ -5577,6 +5682,27 @@ class EmployeeDirectoryDialog(QDialog):
             self.actor["username"],
             role=self.actor.get("role"),
             details={"employee_id": employee.id, "full_name": employee.full_name},
+        )
+        self.refresh_table()
+
+    def _bulk_update_employee_status(self, employees: List[Employee], new_status: str) -> None:
+        ids = [employee.id for employee in employees if employee.id is not None]
+        if not ids:
+            return
+        now = datetime.datetime.now(datetime.timezone.utc)
+        with self.session_factory() as session:
+            for emp_id in ids:
+                db_employee = session.get(Employee, emp_id)
+                if not db_employee:
+                    continue
+                db_employee.status = new_status
+                db_employee.updated_at = now
+            session.commit()
+        audit_logger.log(
+            "employee_bulk_deactivate" if new_status == "inactive" else "employee_bulk_activate",
+            self.actor["username"],
+            role=self.actor.get("role"),
+            details={"employee_ids": ids, "count": len(ids)},
         )
         self.refresh_table()
 
@@ -5864,6 +5990,7 @@ class MainWindow(QMainWindow):
             self.active_week,
             on_week_changed=self._handle_validation_week_change,
             on_status_updated=self._handle_validation_status_updated,
+            on_week_data_changed=self._handle_week_data_changed,
         )
         self.tabs.addTab(prep_tab, "Week Preparation")
         self.tabs.addTab(self._wrap_tab(self.week_schedule_page), "Week Schedule")
@@ -5936,6 +6063,12 @@ class MainWindow(QMainWindow):
             )
 
     def _handle_validation_status_updated(self, status: str) -> None:
+        if hasattr(self, "week_schedule_page") and self.week_schedule_page:
+            self.week_schedule_page.refresh_all()
+
+    def _handle_week_data_changed(self) -> None:
+        if hasattr(self, "preparation_widget") and self.preparation_widget:
+            self.preparation_widget.refresh()
         if hasattr(self, "week_schedule_page") and self.week_schedule_page:
             self.week_schedule_page.refresh_all()
 
