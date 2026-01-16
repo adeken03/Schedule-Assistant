@@ -5421,6 +5421,14 @@ class ScheduleGenerator:
         if old_employee_id == new_employee_id or new_employee_id is None:
             return
         shift["employee_id"] = new_employee_id
+        role_name = shift.get("role") or ""
+        employee = self.employee_lookup.get(new_employee_id)
+        rate = self._employee_role_wage(employee, role_name)
+        shift["labor_rate"] = rate
+        start_dt = shift.get("start")
+        end_dt = shift.get("end")
+        if isinstance(start_dt, datetime.datetime) and isinstance(end_dt, datetime.datetime):
+            shift["labor_cost"] = self._compute_cost(start_dt, end_dt, rate)
         shift["notes"] = self._append_note(shift.get("notes"), tag)
 
     def _create_manual_shift(

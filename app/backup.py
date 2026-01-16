@@ -92,7 +92,13 @@ def backup_json_files(backup_dir: Path) -> None:
     Args:
         backup_dir: Directory to store backup files
     """
-    json_files = ["accounts.json", "week_state.json", "audit.log"]
+    json_files = [
+        "accounts.json",
+        "week_state.json",
+        "audit.log",
+        "role_wages.json",
+        "policy_export.json",
+    ]
     
     for filename in json_files:
         source = DATA_DIR / filename
@@ -192,7 +198,13 @@ def restore_json_files(backup_dir: Path) -> None:
     Args:
         backup_dir: Directory containing backup files
     """
-    json_files = ["accounts.json", "week_state.json", "audit.log"]
+    json_files = [
+        "accounts.json",
+        "week_state.json",
+        "audit.log",
+        "role_wages.json",
+        "policy_export.json",
+    ]
     
     for filename in json_files:
         backup_path = backup_dir / filename

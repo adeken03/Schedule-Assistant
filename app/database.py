@@ -112,7 +112,15 @@ class Employee(EmployeeBase):
 
     @role_list.setter
     def role_list(self, roles: Iterable[str]) -> None:
-        self.roles = ", ".join(sorted({role.strip() for role in roles if role.strip()}))
+        ordered: List[str] = []
+        seen: set[str] = set()
+        for role in roles:
+            label = role.strip()
+            if not label or label in seen:
+                continue
+            seen.add(label)
+            ordered.append(label)
+        self.roles = ", ".join(ordered)
 
     @property
     def start_date_label(self) -> str:
@@ -1052,7 +1060,13 @@ def get_employee_role_wages(employee_session=None, employee_ids: Optional[Iterab
             employee_session.close()
 
 
-def save_employee_role_wages(employee_session, employee_id: int, mapping: Dict[str, float]) -> int:
+def save_employee_role_wages(
+    employee_session,
+    employee_id: int,
+    mapping: Dict[str, float],
+    *,
+    commit: bool = True,
+) -> int:
     employee_session, close_session = _coerce_employee_session(employee_session)
     try:
         employee_session.execute(delete(EmployeeRoleWage).where(EmployeeRoleWage.employee_id == employee_id))
@@ -1070,7 +1084,8 @@ def save_employee_role_wages(employee_session, employee_id: int, mapping: Dict[s
             )
             employee_session.add(entry)
             count += 1
-        employee_session.commit()
+        if commit or close_session:
+            employee_session.commit()
         return count
     finally:
         if close_session:

@@ -42,9 +42,10 @@ from database import (  # noqa: E402
     set_week_status,
 )
 from generator.api import generate_schedule_for_week  # noqa: E402
+from data_exchange import apply_role_wages_to_employees  # noqa: E402
 from policy import ensure_default_policy  # noqa: E402
-from database import Policy, upsert_policy, Employee  # noqa: E402
-from sqlalchemy import delete
+from database import Policy, upsert_policy, Employee, EmployeeRoleWage  # noqa: E402
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 from validation import validate_week_schedule  # noqa: E402
 
@@ -263,6 +264,24 @@ def generate_schedule(payload: Dict[str, Any], db=Depends(get_db)) -> JSONRespon
     if not week_start_raw:
         raise HTTPException(status_code=400, detail="weekStart is required")
     start_date = _parse_week_start(str(week_start_raw))
+    with EmployeeSessionLocal() as employee_db:
+        has_employees = employee_db.scalars(
+            select(Employee.id).where(Employee.status == "active").limit(1)
+        ).first()
+        if not has_employees:
+            raise HTTPException(
+                status_code=400,
+                detail="No active employees found. Import employees before generating a schedule.",
+            )
+        has_wages = employee_db.scalars(select(EmployeeRoleWage.id).limit(1)).first()
+        if not has_wages:
+            apply_role_wages_to_employees(employee_session=employee_db, overwrite=False)
+            has_wages = employee_db.scalars(select(EmployeeRoleWage.id).limit(1)).first()
+        if not has_wages:
+            raise HTTPException(
+                status_code=400,
+                detail="No employee role wages found. Import role wages before generating a schedule.",
+            )
     try:
         result = generate_schedule_for_week(
             SessionLocal,
@@ -270,6 +289,8 @@ def generate_schedule(payload: Dict[str, Any], db=Depends(get_db)) -> JSONRespon
             actor,
             employee_session_factory=EmployeeSessionLocal,
         )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:  # pragma: no cover - surface generator errors
         raise HTTPException(status_code=500, detail=f"schedule generation failed: {exc}") from exc
     return JSONResponse(content=jsonable_encoder(result))

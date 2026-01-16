@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 from database import (
     Shift,
     delete_shift,
+    get_employee_role_wages,
     get_or_create_week_context,
     get_shifts_for_week,
     get_week_daily_projections,
@@ -43,10 +44,11 @@ from database import (
     shift_display_date,
     upsert_shift,
 )
+from data_exchange import apply_role_wages_to_employees
 from generator.api import generate_schedule_for_week
-from policy import build_default_policy, load_active_policy, role_catalog
-from wages import validate_wages
-from roles import grouped_roles, is_manager_role, palette_for_role, role_group, role_matches
+from policy import build_default_policy, hourly_wage, load_active_policy, role_catalog
+from wages import validate_wages, wage_amounts
+from roles import grouped_roles, is_manager_role, normalize_role, palette_for_role, role_group, role_matches
 from ui.edit_shift import EditShiftDialog
 
 DAY_NAMES = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -313,7 +315,7 @@ class WeekSchedulePage(QWidget):
         if not self.week_start:
             return
         with self.session_factory() as session:
-            self.policy = load_active_policy(session)
+            self.policy = self._resolve_policy_payload(load_active_policy(session))
             self.employee_options = list_employees(session, only_active=True)
             self.role_options = list_roles(session)
         self.employee_by_id = {entry["id"]: entry for entry in self.employee_options if entry.get("id") is not None}
@@ -330,6 +332,7 @@ class WeekSchedulePage(QWidget):
         role_param = selected_role if selected_role else None
         status_value = None
         with self.session_factory() as session:
+            self.policy = self._resolve_policy_payload(load_active_policy(session))
             shifts = get_shifts_for_week(
                 session,
                 self.week_start,
@@ -675,6 +678,11 @@ class WeekSchedulePage(QWidget):
                 QMessageBox.warning(self, "Swap owners", "Unable to load the selected shifts.")
                 return
             shift_a.employee_id, shift_b.employee_id = shift_b.employee_id, shift_a.employee_id
+            base_wages = wage_amounts()
+            employee_ids = [emp_id for emp_id in (shift_a.employee_id, shift_b.employee_id) if emp_id]
+            employee_wages = get_employee_role_wages(session, employee_ids)
+            self._apply_employee_wage(shift_a, shift_a.employee_id, employee_wages, base_wages)
+            self._apply_employee_wage(shift_b, shift_b.employee_id, employee_wages, base_wages)
             set_week_status(session, self.week_start, "draft")
             record_audit_log(
                 session,
@@ -708,10 +716,20 @@ class WeekSchedulePage(QWidget):
             QMessageBox.information(self, "Grant shifts", "Selected employee cannot cover those roles.")
             return
         with self.session_factory() as session:
+            base_wages = wage_amounts()
+            employee_wages = (
+                get_employee_role_wages(session, [employee["id"]]) if employee.get("id") is not None else {}
+            )
             for shift_id in eligible:
                 db_shift = session.get(Shift, shift_id)
                 if db_shift:
                     db_shift.employee_id = employee["id"]
+                    self._apply_employee_wage(
+                        db_shift,
+                        employee["id"],
+                        employee_wages,
+                        base_wages,
+                    )
             if self.week_start:
                 set_week_status(session, self.week_start, "draft")
             record_audit_log(
@@ -727,6 +745,54 @@ class WeekSchedulePage(QWidget):
         if skipped:
             message += f" Skipped {skipped} shift(s) due to role mismatch."
         QMessageBox.information(self, "Grant shifts", message)
+
+    @staticmethod
+    def _compute_labor_cost(start: datetime.datetime, end: datetime.datetime, rate: float) -> float:
+        hours = max(0.0, (end - start).total_seconds() / 3600)
+        return round(hours * max(0.0, rate or 0.0), 2)
+
+    def _resolve_role_wage(
+        self,
+        role_name: str,
+        employee_id: Optional[int],
+        employee_wages: Dict[int, Dict[str, float]],
+        base_wages: Dict[str, float],
+    ) -> float:
+        target = normalize_role(role_name)
+        if employee_id and employee_wages:
+            overrides = employee_wages.get(employee_id) or {}
+            for key, value in overrides.items():
+                try:
+                    wage = float(value)
+                except (TypeError, ValueError):
+                    continue
+                if wage <= 0.0:
+                    continue
+                if normalize_role(key) == target:
+                    return wage
+        for key, value in (base_wages or {}).items():
+            try:
+                wage = float(value)
+            except (TypeError, ValueError):
+                continue
+            if wage <= 0.0:
+                continue
+            if normalize_role(key) == target:
+                return wage
+        return hourly_wage(self.policy, role_name, 0.0)
+
+    def _apply_employee_wage(
+        self,
+        shift: Shift,
+        employee_id: Optional[int],
+        employee_wages: Dict[int, Dict[str, float]],
+        base_wages: Dict[str, float],
+    ) -> None:
+        role_name = shift.role or ""
+        rate = self._resolve_role_wage(role_name, employee_id, employee_wages, base_wages)
+        shift.labor_rate = rate
+        if isinstance(shift.start, datetime.datetime) and isinstance(shift.end, datetime.datetime):
+            shift.labor_cost = self._compute_labor_cost(shift.start, shift.end, rate)
 
     def _manager_candidates(self) -> List[Dict]:
         return [
@@ -891,6 +957,20 @@ class WeekSchedulePage(QWidget):
                 "Assign at least one role to each employee before generating a schedule.",
             )
             return False
+        employee_ids = [entry["id"] for entry in employees if entry.get("id") is not None]
+        with self.session_factory() as session:
+            wage_overrides = get_employee_role_wages(session, employee_ids)
+        if not wage_overrides:
+            apply_role_wages_to_employees(overwrite=False)
+            with self.session_factory() as session:
+                wage_overrides = get_employee_role_wages(session, employee_ids)
+        if not wage_overrides:
+            QMessageBox.warning(
+                self,
+                "Missing employee wages",
+                "Import role wages before generating a schedule.",
+            )
+            return False
         wage_issues = validate_wages(roles_needed)
         if wage_issues:
             bullet = "\n".join(f"• {role}: {reason}" for role, reason in sorted(wage_issues.items()))
@@ -961,11 +1041,22 @@ class WeekSchedulePage(QWidget):
         return None
 
     def _policy_labor_pct(self) -> float:
-        global_cfg = self.policy.get("global", {}) if isinstance(self.policy, dict) else {}
-        pct = float(global_cfg.get("labor_budget_pct", 0.27) or 0.0)
+        policy = self.policy if isinstance(self.policy, dict) else {}
+        global_cfg = policy.get("global", {}) if isinstance(policy.get("global"), dict) else {}
+        raw_pct = global_cfg.get("labor_budget_pct", policy.get("labor_budget_pct", 0.27))
+        pct = float(raw_pct or 0.0)
         if pct > 1.0:
             pct /= 100.0
         return max(0.0, min(0.9, pct))
+
+    @staticmethod
+    def _resolve_policy_payload(policy: Dict) -> Dict:
+        if not isinstance(policy, dict):
+            return {}
+        params = policy.get("params")
+        if isinstance(params, dict):
+            return params
+        return policy
 
     @staticmethod
     def _display_group_name(group: str) -> str:
