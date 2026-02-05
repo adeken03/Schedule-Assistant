@@ -222,21 +222,24 @@ def close_minutes(policy: Dict, date_: datetime.date) -> int:
     entry = _hours_entry(policy, date_)
     label = entry.get("close") if entry else None
     parsed = parse_time_label(label)
-    if parsed is not None:
-        return parsed
-    timeblocks = policy.get("timeblocks") or {}
-    close_spec = timeblocks.get("close", {})
-    weekday = weekday_token(date_)
-    by_weekday = close_spec.get("byWeekdayEnd") or {}
-    value = (
-        by_weekday.get(weekday)
-        or by_weekday.get(weekday.lower())
-        or by_weekday.get(weekday.capitalize())
-        or close_spec.get("end")
-        or "24:00"
-    )
-    parsed = parse_time_label(value)
-    return parsed if parsed is not None else 24 * 60
+    if parsed is None:
+        timeblocks = policy.get("timeblocks") or {}
+        close_spec = timeblocks.get("close", {})
+        weekday = weekday_token(date_)
+        by_weekday = close_spec.get("byWeekdayEnd") or {}
+        value = (
+            by_weekday.get(weekday)
+            or by_weekday.get(weekday.lower())
+            or by_weekday.get(weekday.capitalize())
+            or close_spec.get("end")
+            or "24:00"
+        )
+        parsed = parse_time_label(value)
+    close_min = parsed if parsed is not None else 24 * 60
+    open_min = open_minutes(policy, date_)
+    if close_min < open_min:
+        close_min += 24 * 60
+    return close_min
 
 
 def mid_minutes(policy: Dict, date_: datetime.date) -> int:
